@@ -55,6 +55,18 @@ def ha_verify_ssl() -> bool:
     return value not in _SSL_FALSE_VALUES
 
 
+def ha_ssl_kwargs(verify: Optional[bool] = None) -> dict:
+    """aiohttp request kwargs for TLS verification.
+
+    Empty while verifying, so aiohttp keeps its own default on every
+    supported version (aiohttp 3.8 treats ssl=True as "don't verify").
+    Only an explicit opt-out passes ssl=False.
+    """
+    if verify is None:
+        verify = ha_verify_ssl()
+    return {} if verify else {"ssl": False}
+
+
 def parse_timestamp(ts_string: str) -> datetime:
     """
     Parse ISO8601 timestamp string from Home Assistant.
@@ -326,7 +338,7 @@ class HAInterface:
                     params=params,
                     json=json_data,
                     timeout=timeout,
-                    ssl=self.verify_ssl,
+                    **ha_ssl_kwargs(self.verify_ssl),
                 ) as resp:
                     if resp.status in (200, 201):
                         if "application/json" in resp.headers.get("content-type", ""):

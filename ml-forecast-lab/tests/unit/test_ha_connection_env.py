@@ -17,6 +17,7 @@ from ml_forecast_lab import ha_interface
 from ml_forecast_lab.ha_interface import (
     HAInterface,
     ha_base_url,
+    ha_ssl_kwargs,
     ha_token,
     ha_verify_ssl,
 )
@@ -115,6 +116,24 @@ def test_verify_ssl_other_values_keep_verification(monkeypatch, value):
     assert ha_verify_ssl() is True
 
 
+# ---- ha_ssl_kwargs ----
+
+def test_ssl_kwargs_empty_while_verifying():
+    assert ha_ssl_kwargs() == {}
+
+
+def test_ssl_kwargs_disable_only_when_opted_out(monkeypatch):
+    monkeypatch.setenv("HA_VERIFY_SSL", "false")
+    assert ha_ssl_kwargs() == {"ssl": False}
+
+
+def test_ssl_kwargs_explicit_argument_wins(monkeypatch):
+    monkeypatch.setenv("HA_VERIFY_SSL", "false")
+    assert ha_ssl_kwargs(True) == {}
+    monkeypatch.delenv("HA_VERIFY_SSL")
+    assert ha_ssl_kwargs(False) == {"ssl": False}
+
+
 # ---- HAInterface ----
 
 def test_interface_defaults_unchanged_for_addon(monkeypatch):
@@ -163,3 +182,15 @@ def test_api_call_passes_ssl_setting_to_request(monkeypatch):
     assert call["url"] == "https://ha.example.org/api/config"
     assert call["headers"]["Authorization"] == "Bearer llat"
     assert call["ssl"] is False
+
+
+def test_api_call_omits_ssl_while_verifying(monkeypatch):
+    monkeypatch.setenv("HA_URL", "https://ha.example.org")
+    monkeypatch.setenv("HA_TOKEN", "llat")
+    session = _FakeSession()
+    iface = HAInterface(session=session)
+
+    result = asyncio.run(iface.api_call("GET", "/api/config"))
+
+    assert result == {"ok": True}
+    assert "ssl" not in session.calls[0]
