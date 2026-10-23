@@ -30,6 +30,30 @@ HISTORY_READ_TIMEOUT = 180.0
 DEFAULT_RETRIES = 2
 RETRY_BACKOFF_BASE = 1.0
 
+# Connection settings. Inside the add-on the Supervisor proxy and
+# SUPERVISOR_TOKEN are used. A standalone Docker deployment has no
+# Supervisor and sets HA_URL / HA_TOKEN (and optionally HA_VERIFY_SSL)
+# instead.
+SUPERVISOR_CORE_URL = "http://supervisor/core"
+_SSL_FALSE_VALUES = {"false", "0", "no", "off"}
+
+
+def ha_base_url() -> str:
+    """Base URL of the Home Assistant API (HA_URL, else Supervisor proxy)."""
+    url = os.environ.get("HA_URL", "").strip()
+    return url.rstrip("/") if url else SUPERVISOR_CORE_URL
+
+
+def ha_token() -> str:
+    """Bearer token for Home Assistant (HA_TOKEN, else SUPERVISOR_TOKEN)."""
+    return os.environ.get("HA_TOKEN") or os.environ.get("SUPERVISOR_TOKEN", "")
+
+
+def ha_verify_ssl() -> bool:
+    """Whether to verify Home Assistant's TLS certificate (HA_VERIFY_SSL)."""
+    value = os.environ.get("HA_VERIFY_SSL", "").strip().lower()
+    return value not in _SSL_FALSE_VALUES
+
 
 def parse_timestamp(ts_string: str) -> datetime:
     """
@@ -226,12 +250,18 @@ class HAInterface:
         Initialise HA interface.
 
         Args:
-            ha_url: Base URL (defaults to http://supervisor/core)
-            ha_key: Bearer token (defaults to SUPERVISOR_TOKEN env var)
+            ha_url: Base URL (defaults to HA_URL, else http://supervisor/core)
+            ha_key: Bearer token (defaults to HA_TOKEN, else SUPERVISOR_TOKEN)
             session: Existing aiohttp session; create new if None
         """
-        self.ha_url = ha_url or "http://supervisor/core"
-        self.ha_key = ha_key or os.environ.get("SUPERVISOR_TOKEN", "")
+        self.ha_url = ha_url or ha_base_url()
+        self.ha_key = ha_key or ha_token()
+        self.verify_ssl = ha_verify_ssl()
+        if not self.ha_key:
+            logger.error(
+                "No Home Assistant token: set HA_TOKEN when running "
+                "standalone (inside the add-on SUPERVISOR_TOKEN is used)"
+            )
         self.session = session
         self._owns_session = session is None
 
@@ -296,6 +326,7 @@ class HAInterface:
                     params=params,
                     json=json_data,
                     timeout=timeout,
+                    ssl=self.verify_ssl,
                 ) as resp:
                     if resp.status in (200, 201):
                         if "application/json" in resp.headers.get("content-type", ""):
