@@ -9,6 +9,7 @@ This is the full reference for users running the app. For a quick install and a 
 3. [Published Home Assistant sensors](#published-home-assistant-sensors)
 4. [Web UI tour](#web-ui-tour)
 5. [Operations](#operations)
+   - [Running standalone (without the Supervisor)](#running-standalone-without-the-supervisor)
 6. [Troubleshooting](#troubleshooting)
 7. [Upgrading and version compatibility](#upgrading-and-version-compatibility)
 
@@ -461,6 +462,32 @@ The SQLite database survives the experiment deletion — only the per-experiment
 ### Updating the app
 
 Updates are delivered via the HA app store like any other app. Read the [CHANGELOG](CHANGELOG.md) before upgrading — the changelog calls out behaviour changes that require config edits.
+
+### Running standalone (without the Supervisor)
+
+The add-on image also runs as a plain Docker container, for example on a
+separate Docker host or when Home Assistant runs as Container/Core. An
+example lives in [`standalone/docker-compose.yml`](../standalone/docker-compose.yml).
+
+| Variable | Purpose |
+| --- | --- |
+| `HA_URL` | Base URL of Home Assistant, e.g. `http://homeassistant.local:8123`. Defaults to the Supervisor proxy. |
+| `HA_TOKEN` | Long-lived access token (Profile → Security). Defaults to `SUPERVISOR_TOKEN`. |
+| `HA_VERIFY_SSL` | `false` accepts self-signed certificates. Default: verify. |
+
+Build arguments:
+
+| Argument | Purpose |
+| --- | --- |
+| `BUILD_FROM` | Base image, e.g. `ghcr.io/hassio-addons/ubuntu-base/amd64:9.0.5` (see `build.yaml`). |
+| `TORCH_INDEX_URL` | Optional pip index for torch, e.g. `https://download.pytorch.org/whl/cpu` for CPU-only wheels. |
+
+Mount a directory to `/config`; `mlfl.yaml` is created there on first start.
+Mount `/data` to keep the history cache and trained models across updates.
+
+A dedicated non-admin Home Assistant user for the token is recommended.
+Without the Supervisor the "restart add-on" button on the System page has
+no effect; restart the container instead.
 
 ### Developer mode — running a branch (maintainers only)
 
