@@ -467,13 +467,13 @@ Updates are delivered via the HA app store like any other app. Read the [CHANGEL
 
 The add-on image also runs as a plain Docker container, for example on a
 separate Docker host or when Home Assistant runs as Container/Core. An
-example lives in [`standalone/docker-compose.yml`](../standalone/docker-compose.yml).
+example lives in [`standalone/docker-compose.yml`](https://github.com/psweens/ml-forecast-lab/blob/main/standalone/docker-compose.yml).
 
 | Variable | Purpose |
 | --- | --- |
 | `HA_URL` | Base URL of Home Assistant, e.g. `http://homeassistant.local:8123`. Defaults to the Supervisor proxy. |
 | `HA_TOKEN` | Long-lived access token (Profile → Security). Defaults to `SUPERVISOR_TOKEN`. |
-| `HA_VERIFY_SSL` | `false` accepts self-signed certificates. Default: verify. |
+| `HA_VERIFY_SSL` | `false` (or `0`/`no`/`off`) accepts self-signed certificates. Default: verify. |
 
 Build arguments:
 
@@ -486,8 +486,7 @@ Mount a directory to `/config`; `mlfl.yaml` is created there on first start.
 Mount `/data` to keep the history cache and trained models across updates.
 
 A dedicated non-admin Home Assistant user for the token is recommended.
-Without the Supervisor the "restart add-on" button on the System page has
-no effect; restart the container instead.
+Without the Supervisor the app cannot restart itself; where the UI says to restart the add-on, restart the container instead.
 
 ### Developer mode — running a branch (maintainers only)
 
