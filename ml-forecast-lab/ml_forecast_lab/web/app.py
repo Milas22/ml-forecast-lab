@@ -1581,6 +1581,20 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
 
     # ========== API Routes ==========
 
+    def _dispatch_benchmark(name: str) -> None:
+        """Schedule benchmark_callback (a coroutine function) on the loop.
+
+        Calling it bare only creates the coroutine; it never runs. The task
+        is tracked in _pipeline_tasks like run-pipeline's, so stop-training
+        can cancel it and it isn't garbage-collected mid-run.
+        """
+        appstate = app.state.appstate
+        task = asyncio.create_task(appstate.benchmark_callback(name))
+        appstate._pipeline_tasks[name] = task
+        task.add_done_callback(
+            lambda t, n=name: appstate._pipeline_tasks.pop(n, None)
+        )
+
     @app.post("/experiment/{name}/run-benchmark")
     async def run_benchmark(name: str):
         """
@@ -1605,7 +1619,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         # with 409 until the add-on restarts.
         if app.state.appstate.benchmark_callback:
             try:
-                app.state.appstate.benchmark_callback(name)
+                _dispatch_benchmark(name)
             except Exception:
                 # Clear the flag if dispatch itself raises so the experiment
                 # isn't permanently jammed; the callback's own error path
@@ -1638,7 +1652,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
                 app.state.appstate.start_benchmark(name)
                 if app.state.appstate.benchmark_callback:
                     try:
-                        app.state.appstate.benchmark_callback(name)
+                        _dispatch_benchmark(name)
                     except Exception:
                         pass
                 queued.append(name)
