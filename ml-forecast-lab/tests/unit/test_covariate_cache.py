@@ -508,7 +508,7 @@ def test_failed_backfill_is_retried_next_cycle(db):
     failed = _run(resolver.fetch_history(
         cov, now - timedelta(days=10), now, "30min",
     ))
-    assert failed.empty, "precondition: the widening fetch failed"
+    assert not failed.empty and failed.index[-1] - failed.index[0] < pd.Timedelta(days=3), "served the cached narrow window"
 
     # The next cycle must try the full window again.
     recovered = _run(resolver.fetch_history(

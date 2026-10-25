@@ -1298,6 +1298,7 @@ def resolve_missingness(
     missing_suffix: str = MISSING_SUFFIX,
     required_indicators: Optional[Sequence[str]] = None,
     source_columns: Optional[Sequence[str]] = None,
+    empty_fill: Optional[dict] = None,
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Turn a feature frame built on a complete grid into supervised rows.
@@ -1381,6 +1382,7 @@ def resolve_missingness(
         'indicator_cols': [],
         'dropped_indicators': [],
         'empty_cols': [],
+        'filled_cols': {},
         'label_gap_spans': [],
     }
     if n_rows == 0:
@@ -1415,6 +1417,14 @@ def resolve_missingness(
             continue
         if series.notna().sum() == 0:
             report['empty_cols'].append(col)
+            if empty_fill and col in empty_fill:
+                # No observation in this window, but the model's own training
+                # window had some: their causal statistic is still strictly
+                # prior, so it is the honest fill. Flagged everywhere.
+                out[col] = series.fillna(float(empty_fill[col]))
+                masks[col] = series.isna()
+                report['filled_cols'][col] = float(empty_fill[col])
+                continue
         filled, mask = causal_impute(
             series, method='hold' if is_binary_column(series) else 'median',
         )

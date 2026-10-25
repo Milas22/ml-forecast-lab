@@ -103,7 +103,9 @@ and `ml_forecast_lab/__init__.py` (`__version__`). `release.yml` refuses a tag w
 release notes** — write it at tag time. HA Supervisor reads `config.yaml` off `main` to offer
 users the update, and updating the add-on restarts it; the model-cache `schema_version` gate in
 `_restore_cached_models` then decides whether cached models survive or retrain. Bump that schema
-version whenever a change alters what a cached model would be fed at inference.
+version whenever a change alters what a cached model would be fed at inference relative to what it
+was trained on (a training-side feature or window change). An inference-only fix that brings the
+inputs back in line with training needs none — a retrain would rebuild the same model (v2.53.0).
 
 Release commits follow `v<version>: lowercase one-line summary`.
 

@@ -245,6 +245,7 @@ from ml_forecast_lab.preprocessing import (  # noqa: E402
 from ml_forecast_lab.features import (  # noqa: E402
     MISSING_SUFFIX,
     TARGET_MISSING_COLUMN,
+    is_holiday,
     neural_covariate_columns,
     rebuild_fold_features,
 )
@@ -583,6 +584,91 @@ def _seed_lag_buffer(grid_y, fallback, last_ts, n_values: int):
     )
 
 
+# Columns ``_fetch_and_preprocess`` computes from the grid rather than fetches.
+# Never reinstated as all-NaN: ``clear_sky_ghi``'s mere presence switches on
+# build_features' night gate, which would zero every lag against a NaN ghi.
+_COMPUTED_SOURCE_COLUMNS = frozenset({"sun_elevation", "clear_sky_ghi"})
+
+
+def _fitted_source_columns(feature_cols) -> list:
+    """Covariate / physics columns of a fitted schema, in fitted order:
+    build_features gives every source column an ``_x_hour_sin`` pair."""
+    fitted = set(feature_cols)
+    return [c for c in feature_cols if f"{c}_x_hour_sin" in fitted]
+
+
+def _pinned_indicator_map(pinned, feature_cols) -> dict:
+    """``{indicator: covariate}`` for the cache's pinned indicator set,
+    mirroring how resolve_missingness named them (``_missing``, or
+    ``_missing_flag`` when ``<col>_missing`` is itself a column).
+
+    v2.53.0: replaces ``_inference_indicator_map`` (polarity documented
+    there) at inference — the pinned set, not the name suffix, is the
+    record of which flags the model was fitted with.
+    """
+    pinned = set(pinned)
+    sources = _fitted_source_columns(feature_cols)
+    source_set = set(sources)
+    out = {}
+    for c in sources:
+        name = f"{c}{MISSING_SUFFIX}"
+        if name in source_set:
+            name = f"{name}_flag"
+        if name in pinned:
+            out[name] = c
+    return out
+
+
+def _covariate_fill_values(df, feature_cols) -> dict:
+    """Per fitted covariate, what ``causal_impute`` would fill a gap with at
+    the end of the training window: the median of its observations, or the
+    last one for a binary channel. Stored with the model for a covariate
+    that later arrives with no observation at all."""
+    from ml_forecast_lab.preprocessing import is_binary_column
+    fitted = set(feature_cols)
+    out = {}
+    for c in feature_cols:
+        if (f"{c}_x_hour_sin" not in fitted or c not in df.columns
+                or c in _COMPUTED_SOURCE_COLUMNS):
+            continue
+        obs = df[c].dropna()
+        if obs.empty:
+            continue
+        out[c] = float(obs.iloc[-1] if is_binary_column(df[c]) else obs.median())
+    return out
+
+
+def _reinstate_trained_covariates(df, feature_cols):
+    """Give back, as all-NaN columns, covariates the model was fitted on but
+    the fresh fetch left out. Returns ``(frame, reinstated)``.
+
+    v2.53.0: ``fetch_history`` returns an empty series on any HA error and
+    ``_fetch_and_preprocess`` then adds no column (a lagged-only column with
+    0% coverage is dropped outright). Absent, the column bypassed
+    ``resolve_missingness``: the tree row builder supplied 0.0, the pinned
+    indicator was zero-filled ("measured"), and the backstop never fired.
+    As an all-NaN column it is masked, imputed and flagged like any gap.
+
+    Source columns are read off the fitted schema — build_features gives
+    every one an ``_x_hour_sin`` pair — never off a name suffix. Placed in
+    fitted order so tree columns and neural channels line up. A frame
+    missing nothing is returned as the same object.
+    """
+    sources = _fitted_source_columns(feature_cols)
+    absent = [
+        c for c in sources
+        if c not in df.columns and c not in _COMPUTED_SOURCE_COLUMNS
+    ]
+    if not absent:
+        return df, []
+    out = df.copy()
+    for c in absent:
+        out[c] = np.nan
+    head = ["y"] + [c for c in sources if c in out.columns]
+    placed = set(head)
+    return out[head + [c for c in out.columns if c not in placed]], absent
+
+
 def _supervised_frame(
     df,
     features_df,
@@ -590,6 +676,7 @@ def _supervised_frame(
     covariate_cols=None,
     required_indicators=None,
     label: str = "",
+    empty_fill=None,
 ):
     """Assemble the model-ready frame from a complete grid.
 
@@ -642,6 +729,7 @@ def _supervised_frame(
         combined, "target", warmup,
         required_indicators=required_indicators,
         source_columns=covariate_cols,
+        empty_fill=empty_fill,
     )
 
     tag = f"[{label}] " if label else ""
@@ -652,9 +740,12 @@ def _supervised_frame(
             f"− {report['label_gap_rows']} unmeasured label); "
             f"indicators={report['indicator_cols'] or 'none'}"
         )
-    if report["empty_cols"]:
+    _zero_filled = [
+        c for c in report["empty_cols"] if c not in report.get("filled_cols", {})
+    ]
+    if _zero_filled:
         logger.warning(
-            f"  {tag}Covariate(s) {report['empty_cols']} had no observations "
+            f"  {tag}Covariate(s) {_zero_filled} had no observations "
             f"in the window — imputed at 0.0 with their indicator raised for "
             f"every row. They carry no signal this cycle."
         )
@@ -1047,6 +1138,7 @@ def _cache_meta(cache: dict) -> dict:
         "missing_indicators": list(
             cache.get("missing_indicators") or []
         ),
+        "covariate_fill": dict(cache.get("covariate_fill") or {}),
         "trained_at": cache["trained_at"].isoformat(),
         "model_version": cache["model_version"],
         "is_neural": is_neural,
@@ -1122,6 +1214,7 @@ def _cache_entry_from_meta(meta: dict, model, exp_cfg) -> dict:
         "missing_indicators": list(
             meta.get("missing_indicators") or []
         ),
+        "covariate_fill": dict(meta.get("covariate_fill") or {}),
         "combined": None,  # re-fetched on first forecast
         "exp_cfg": exp_cfg,
         "trained_at": trained_at,
@@ -5315,7 +5408,9 @@ class MLForecastLabApp:
             # Lag buffer: chronological, grows with each prediction.
             # Seeded from the complete grid so buf[-k] really is k intervals
             # ago even when the target has a recent outage.
-            cov_indicators = _inference_indicator_map(feature_cols)
+            cov_indicators = _pinned_indicator_map(
+                missing_report.get("indicator_cols") or [], feature_cols,
+            )
             last_flag_vals = {
                 c: float(combined[c].iloc[-1])
                 for c in cov_indicators if c in combined.columns
@@ -5341,6 +5436,8 @@ class MLForecastLabApp:
                 row['hour_cos'] = float(np.cos(hr_rad))
                 row['dow_sin'] = float(np.sin(dw_rad))
                 row['dow_cos'] = float(np.cos(dw_rad))
+                if 'is_holiday' in feature_cols:
+                    row['is_holiday'] = float(is_holiday(ts, exp_cfg.country))
                 # Lag features
                 for lag in range(1, n_lags + 1):
                     row[f'y_lag_{lag}'] = float(buf[-lag]) if lag <= len(buf) else 0.0
@@ -5414,7 +5511,7 @@ class MLForecastLabApp:
                 for step in range(future_periods):
                     ts = last_ts + pd.Timedelta(minutes=exp_cfg.interval_minutes * (step + 1))
                     row_dict = _build_feature_row(ts, lag_buffer, step)
-                    row_vals = [row_dict.get(c, 0.0) for c in feature_cols]
+                    row_vals = [row_dict.get(c, np.nan) for c in feature_cols]
                     X_row = np.array([row_vals], dtype=np.float32)
                     X_row = _nan_to_num_guarded(
                         X_row, "production recursive forecast row", feature_cols,
@@ -6375,6 +6472,7 @@ class MLForecastLabApp:
             "missing_indicators": list(
                 missing_report.get("indicator_cols", [])
             ),
+            "covariate_fill": _covariate_fill_values(df, feature_cols),
             "combined": combined,
             "exp_cfg": exp_cfg,
             "trained_at": trained_at,
@@ -7724,6 +7822,25 @@ class MLForecastLabApp:
                     status="insufficient_data", exp_cfg=exp_cfg,
                     model_name=prod_model_name,
                 )
+            # Tree path only: a sequence model's past window would be
+            # wholly invented, and the channel-parity guard already
+            # refuses that forecast rather than publish it.
+            _reinstated = []
+            _fill = cache.get("covariate_fill") or {}
+            if not (is_neural and 'sequence_data' in seq_kwargs):
+                df_fresh, _reinstated = _reinstate_trained_covariates(
+                    df_fresh, feature_cols,
+                )
+            if _reinstated:
+                logger.warning(
+                    f"  {exp_cfg.name}: covariate(s) {_reinstated} the model "
+                    f"was trained on are missing from this cycle's data (no "
+                    f"history returned, or removed from the config) — "
+                    f"forecasting with them held at "
+                    f"{ {c: _fill.get(c, 0.0) for c in _reinstated} } and "
+                    f"flagged as imputed until the next retrain."
+                )
+                diag["reinstated_covariates"] = list(_reinstated)
             features_fresh = build_features(
                 df_fresh, target_col="y",
                 interval_minutes=exp_cfg.interval_minutes,
@@ -7748,6 +7865,7 @@ class MLForecastLabApp:
                 df_fresh, features_fresh, exp_cfg,
                 required_indicators=required_indicators,
                 label="forecast",
+                empty_fill={c: _fill[c] for c in _reinstated if c in _fill} or None,
             )
             _grid_y = df_fresh["y"]
             _fresh_window_frame = _fresh_missing_report["window_frame"]
@@ -8012,22 +8130,16 @@ class MLForecastLabApp:
             # At each step, we build a single feature row using the most recent
             # lag values (which include previous predictions), predict, then
             # roll the lag buffer forward with the new prediction.
-            engineered = {
-                'hour_of_day', 'day_of_week', 'is_weekend', 'month', 'day_of_month',
-                'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'is_holiday', 'y_diff_1',
-            }
+            # Read off the fitted schema, not off name shapes: a covariate
+            # called `y_*` or `*_missing` used to fall out of this list and
+            # reach the model as 0.0 (itself or its interactions).
             raw_cov_cols = [
-                c for c in combined.columns
-                if c != 'target'
-                and c not in engineered
-                and not c.startswith('y_')
-                and not c.endswith('_x_hour_sin')
-                and not c.endswith('_x_hour_cos')
-                # Indicators are set from whether this row's covariate
-                # value is real, not carried forward like a value.
-                and not c.endswith(MISSING_SUFFIX)
+                c for c in _fitted_source_columns(feature_cols)
+                if c in combined.columns
             ]
-            cov_indicators = _inference_indicator_map(feature_cols)
+            cov_indicators = _pinned_indicator_map(
+                cache.get("missing_indicators") or [], feature_cols,
+            )
             last_flag_vals = {
                 c: float(combined[c].iloc[-1])
                 for c in cov_indicators if c in combined.columns
@@ -8151,6 +8263,8 @@ class MLForecastLabApp:
                 row['hour_cos'] = float(np.cos(hr_rad))
                 row['dow_sin'] = float(np.sin(dw_rad))
                 row['dow_cos'] = float(np.cos(dw_rad))
+                if 'is_holiday' in feature_cols:
+                    row['is_holiday'] = float(is_holiday(ts, exp_cfg.country))
                 # Lag features (buf is chronological: oldest..newest,
                 # y_lag_i = i-th most recent past value)
                 for lag in range(1, n_lags + 1):
@@ -8239,7 +8353,7 @@ class MLForecastLabApp:
                     ts = last_ts + pd.Timedelta(minutes=exp_cfg.interval_minutes * (step + 1))
                     row_dict = _build_feature_row(ts, lag_buffer, step)
                     # Align to training feature order
-                    row_vals = [row_dict.get(c, 0.0) for c in feature_cols]
+                    row_vals = [row_dict.get(c, np.nan) for c in feature_cols]
                     X_row = np.array([row_vals], dtype=np.float32)
                     X_row = _nan_to_num_guarded(
                         X_row, "cached recursive forecast row", feature_cols,

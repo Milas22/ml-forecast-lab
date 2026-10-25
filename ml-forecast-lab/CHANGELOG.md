@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.53.0
+
+### Fixed
+
+**Forecasts no longer treat a sensor that couldn't be read as zero.**
+
+- If Home Assistant briefly failed to return a covariate's history, tree
+  models were given 0 for it, which could pull the forecast well away from
+  normal.
+- The app now uses the covariate's saved history, or else its typical value
+  from training, and the log names the covariate.
+- Neural models still skip that forecast until the covariate is back.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Public holidays reach the forecast.**
+
+- With `country` set, tree models were trained with the holiday feature but
+  always forecast as if no day was a holiday.
+- Forecasts for public holidays now use it, so they can change on those days.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Covariates named like `y_…` or `…_missing` keep their values.**
+
+- A covariate whose sensor name started with `y_` was fed 0 when forecasting,
+  and one ending in `_missing` lost part of its signal.
+- They are now fed their real values, so forecasts that use them can change.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
 ## 2.52.7
 
 ### Fixed
