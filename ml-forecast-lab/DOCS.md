@@ -41,7 +41,7 @@ The app searches these in order: explicit `--config-path` (development only) →
 | `cpu_cores` | int | `0` (= all) | Caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `torch.set_num_threads` so training doesn't saturate every core. |
 | `nice_priority` | int 0–19 | `10` | Process `nice` value for training. Higher numbers = lower priority, so the Pi stays responsive during a benchmark. |
 | `model_overrides` | mapping | `{}` | Global per-model hyperparameter overrides; keys are model registry names (e.g. `lightgbm`, `lstm`). |
-| `external_forecast_retention_days` | int (days) | `60` | How long captured third-party forecast trajectories (Forecast Comparison tab) are kept before pruning — its own window, separate from the add-on's 120-day forecast log. Editable in the System tab. |
+| `external_forecast_retention_days` | int (days) | `60` | How long captured third-party forecast trajectories (Forecast Comparison tab) are kept before pruning — its own window, separate from the app's 120-day forecast log. Editable in the System tab. |
 | `experiments` | list | required | One entry per sensor you want to forecast. |
 
 ### Experiment essentials
@@ -57,6 +57,7 @@ The app searches these in order: explicit `--config-path` (development only) →
 | `forecast_every_minutes` | int | inherits global | Per-experiment override of the inference cadence. |
 | `retrain_every_hours` | float | inherits global | Per-experiment override of the retrain cadence. |
 | `country` | ISO code | unset | Two-letter country code for holiday features (`GB`, `US`, `DE`, …). Unset = no holiday feature. |
+| `target_is_nonnegative` | bool | `false` | Set `true` for targets that can't go below zero (solar power, irradiance, demand). Forecasts are clamped at zero, so `_cumulative` always has a value, and solar experiments are trained with every night-time reading set to zero (or `idle_value`), measured or not, which can shift their forecasts. Takes effect at the next retrain. Cumulative sources get the clamp automatically. |
 | `units` | string | `""` | Target units (`W`, `kWh`, `%`, …). Shown in the UI and on published sensors. If left blank, the unit is auto-inherited from the target sensor's own `unit_of_measurement` in Home Assistant — so for most experiments you don't need to set this at all. The inherited unit is remembered across restarts, so a target Home Assistant hasn't re-created yet after a reboot doesn't strip the unit from the forecast sensors. |
 | `max_age` | int (days) | `365` | Cap on rows kept in the SQLite cache for this experiment's target, covariates and state-mode external forecasts. The cache is always-on (v2.33.1+); older rows are pruned each cycle. Cache tables are keyed by entity, so when several experiments reference the same entity the table is pruned at the **largest** `max_age` among them (v2.50.0+) — a short-`max_age` experiment can no longer delete history a longer-lived one still trains on. Set this at least as large as `days_history`, or the cache is pruned back inside the window you train on. |
 | `publish_prefix` | string | `mlfl_` | Prefix for every companion sensor. Change only if you have a naming clash. |
@@ -219,7 +220,7 @@ When `include_clear_sky_irradiance` is on, the app also gates production forecas
 
 ### External forecast comparison
 
-Compare this add-on's forecast against up to **five third-party forecasts of the same target** — ones *not* produced by this add-on (Solcast, a utility day-ahead curve, another model). Each experiment has a **Forecast Comparison** tab that scores this add-on head-to-head against each, all against the actuals (verdict + accuracy-ranking table + overlay chart + per-lead-time curve). Add and remove the sensors directly on that tab, or edit the `external_forecasts` list in YAML. Each entry:
+Compare this app's forecast against up to **five third-party forecasts of the same target** — ones *not* produced by this app (Solcast, a utility day-ahead curve, another model). Each experiment has a **Forecast Comparison** tab that scores this app head-to-head against each, all against the actuals (verdict + accuracy-ranking table + overlay chart + per-lead-time curve). Add and remove the sensors directly on that tab, or edit the `external_forecasts` list in YAML. Each entry:
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -233,7 +234,7 @@ Compare this add-on's forecast against up to **five third-party forecasts of the
 
 The comparison is **unit-aware**: it reads each sensor's HA `unit_of_measurement` and converts everything into a common space, so a cumulative **kWh** energy sensor lines up correctly against an instantaneous **kW** power target with no manual setup (cumulative shape is differenced; power↔energy is reconciled via the interval length and base units). When a unit isn't a recognised power/energy unit, the series is left raw and a scale-mismatch guard warns rather than guessing. The tab has a **per-interval ↔ cumulative** toggle: per-interval shows per-bin demand in the target's native unit; cumulative shows the running daily total in kWh (integrating power forecasts to energy), which is what makes a daily-total energy sensor directly comparable.
 
-The tab presents an **accuracy leaderboard** that ranks this add-on inline against every external (with #1/#2/#3 badges like the Results tab). A **Rank by** selector chooses the basis — *Overall* (a composite mean rank across MAE, RMSE and Daily MAE; the default) or a single metric (MAE, RMSE, Bias, % of typical, Daily MAE, Daily bias) — and the ranking, column highlighting, the "vs MLFL" gap and the verdict all follow it. Each source is held **provisional until it has 7 days of overlapping data** (shown as an `n/7 ⏳` badge with a "results are provisional" banner) so a winner isn't declared off a handful of samples. Alongside the overlay there's an **error-by-time-of-day** chart and, for trajectory externals, a per-horizon error curve; a comparison-basis line reports each forecaster's median lead so the head-to-head is read at the right horizon. External forecast lead times reflect the source's own freshness (its HA `last_updated`), not the add-on's capture cadence.
+The tab presents an **accuracy leaderboard** that ranks this app inline against every external (with #1/#2/#3 badges like the Results tab). A **Rank by** selector chooses the basis — *Overall* (a composite mean rank across MAE, RMSE and Daily MAE; the default) or a single metric (MAE, RMSE, Bias, % of typical, Daily MAE, Daily bias) — and the ranking, column highlighting, the "vs MLFL" gap and the verdict all follow it. Each source is held **provisional until it has 7 days of overlapping data** (shown as an `n/7 ⏳` badge with a "results are provisional" banner) so a winner isn't declared off a handful of samples. Alongside the overlay there's an **error-by-time-of-day** chart and, for trajectory externals, a per-horizon error curve; a comparison-basis line reports each forecaster's median lead so the head-to-head is read at the right horizon. External forecast lead times reflect the source's own freshness (its HA `last_updated`), not the app's capture cadence.
 
 ```yaml
 external_forecasts:
@@ -246,7 +247,7 @@ external_forecasts:
     mode: state
 ```
 
-Only collects data while the experiment is in **production** (that's when this add-on logs its own forecasts), and data accrues from when you add each external — apart from state-mode sensors, which are back-filled once from recorder history so they show immediately. Storage is bounded: the captured trajectory log is pruned on its own window — `external_forecast_retention_days` (default 60, editable in the System tab) — and state-mode caches to the experiment's `max_age`. Legacy single-sensor configs using the flat `external_forecast_*` keys are auto-migrated into this list on load.
+Only collects data while the experiment is in **production** (that's when this app logs its own forecasts), and data accrues from when you add each external — apart from state-mode sensors, which are back-filled once from recorder history so they show immediately. Storage is bounded: the captured trajectory log is pruned on its own window — `external_forecast_retention_days` (default 60, editable in the System tab) — and state-mode caches to the experiment's `max_age`. Legacy single-sensor configs using the flat `external_forecast_*` keys are auto-migrated into this list on load.
 
 ### Cross-validation
 
@@ -370,12 +371,17 @@ When an experiment is in `mode: production`, the app publishes the following sen
 |---|---|---|
 | `sensor.mlfl_<name>_forecast` | The next interval's forecast value. | Attributes include the full future curve as a list of `{datetime, value}` pairs. |
 | `sensor.mlfl_<name>_interval` | The next interval's value, expressed as a per-interval increment. | Published only when `source_is_cumulative` is true (otherwise identical to `_forecast`). |
-| `sensor.mlfl_<name>_cumulative` | The integrated forecast curve. Resets at local midnight when `source_is_cumulative` and `reset_daily` are both true; otherwise a `cumsum` anchored at zero. | Useful for daily-budget automations (EV planning, hot-water tank pre-heat). |
-| `sensor.mlfl_<name>_upper_<pct>` | Upper conformal band at the `<pct>` coverage level (default `80`). | Renamed to match `conformal_coverage` — e.g. `_upper_90` if you set `0.9`. Appears once enough residuals have been calibrated; cold-start may take ~10 forecast cycles. |
+| `sensor.mlfl_<name>_cumulative` | The integrated forecast curve. Resets at local midnight when `source_is_cumulative` and `reset_daily` are both true; otherwise a `cumsum` anchored at zero. | Useful for daily-budget automations (EV planning, hot-water tank pre-heat). Shows `unknown` with `status: signed_predictions` when the forecast dips below zero, because a running total of signed values drifts; for targets that can't be negative (solar power, demand) set `target_is_nonnegative: true`. |
+| `sensor.mlfl_<name>_upper_<pct>` | Upper conformal band at the `<pct>` coverage level (default `80`). | Renamed to match `conformal_coverage` — e.g. `_upper_90` if you set `0.9`. Shows `unknown` with `status: no_conformal_bands` until enough residuals have been calibrated; cold-start may take ~10 forecast cycles. |
 | `sensor.mlfl_<name>_lower_<pct>` | Lower conformal band. | As above. |
 | `sensor.mlfl_<name>_forecast_accuracy` | Mean absolute error of the next-interval forecast over the last 30 days. Per interval when `source_is_cumulative` is true. | Recomputed on every forecast publish. Attributes carry the full lead-time curve (`lead_hours`, `mae`, `rmse`, `sample_count`) and the first-versus-latest revision MAE. `status` reads `accumulating` until a next-interval forecast has been scored. |
-| `sensor.mlfl_<name>_last_benchmark` | ISO timestamp of the most recent benchmark completion. | `device_class: timestamp`. Attributes include outcome, duration, winner, and a truncated error string when the cycle failed — convenient triggers for HA automations. |
-| `sensor.mlfl_<name>_last_retrain` | ISO timestamp of the most recent retrain. | Same shape as `_last_benchmark`. |
+| `sensor.mlfl_<name>_last_benchmark` | ISO timestamp of the most recent benchmark completion. | `device_class: timestamp`. Updated by every benchmark, including one started from the Training tab. Home Assistant drops it when it restarts; it comes back at the next benchmark rather than being re-created, so automations on it don't fire for a benchmark that didn't happen. Attributes include outcome, duration, winner, and a truncated error string when the cycle failed — convenient triggers for HA automations. |
+| `sensor.mlfl_<name>_last_retrain` | ISO timestamp of the most recent retrain. | Same shape as `_last_benchmark`; after a Home Assistant restart it comes back at the next retrain. |
+| `sensor.mlfl_last_run` | ISO timestamp of the app's most recent successful forecast or retrain, across all experiments. | A heartbeat, updated within a minute: if it stops advancing, the app has stopped forecasting. |
+
+Home Assistant does not keep these sensors across its own restart. The app checks every minute and puts the forecast sensors and `sensor.mlfl_last_run` back with the last forecast's values, then refreshes them at the next forecast. After the app itself starts, each experiment with a trained model forecasts within two minutes; an experiment still training appears when its retrain finishes.
+
+Forecast sensors exist only while their experiment is in production. When you switch an experiment to lab or delete it, the app removes its forecast sensors within about two minutes. When you change its `publish_name`, `publish_prefix` or `conformal_coverage`, forecasts keep the old names until the next retrain, and the old sensors are removed once the new ones appear. The `_last_retrain` and `_last_benchmark` sensors stay while the experiment exists. Removed sensors keep their recorded history in Home Assistant; removal needs Supervisor 2026.02 or later, and on older versions the app leaves them in place.
 
 ---
 
@@ -390,7 +396,7 @@ Open the UI via the app's **Open Web UI** button (HA ingress).
   - **Tuning.** Bayesian optimisation (Optuna TPE) per model with default vs tuned holdout comparison. **Tune All Enabled** sweeps every enabled backend sequentially.
   - **Results.** Composite mean rank across MAE / RMSE / MASE (Demšar-style averaging of per-fold ranks — see [`docs/RANKING_NOTES.md`](docs/RANKING_NOTES.md) for what the rank does and does not claim) with 95% bootstrap CIs over fold resamples so the leaderboard can flag genuine ties ("T#1") rather than promoting a single winner that's within noise of second place. Models that errored on at least one fold are listed separately under **Did not complete** rather than ranked last — keeps the comparison like-for-like. Plus the always-on "vs Seasonal Naive" skill chip, a pairwise model-comparison matrix (paired-t test on per-fold MAE), the training-window vs test-window drift verdict (PSI), and a "Compare with previous run" strip — the last five benchmarks are retained and diff-able.
   - **Forecast Accuracy.** Three-layer diagnostic: verdict chip, per-horizon error chart, retrain-history chips (filter the chart to a specific `(model_name, model_version)` cohort). Conformal-band calibration countdown surfaces "Calibrating · N of 10 residuals" rather than a silent blank.
-  - **Forecast Comparison.** Add up to five third-party forecast sensors (Solcast, a utility curve, another model) right on the tab, and it scores this add-on's published forecast head-to-head against each — all against the actuals — as an **accuracy leaderboard** (rank by a composite or a single metric, with #1/#2/#3 badges), plus an overlay chart, an error-by-time-of-day chart, and (for trajectory sensors) a per-horizon error curve. Unit-aware, with a per-interval ↔ cumulative toggle; sources stay provisional until they have 7 days of overlap. Scoring runs once the experiment is in production. See *Configuration reference → External forecast comparison*.
+  - **Forecast Comparison.** Add up to five third-party forecast sensors (Solcast, a utility curve, another model) right on the tab, and it scores this app's published forecast head-to-head against each — all against the actuals — as an **accuracy leaderboard** (rank by a composite or a single metric, with #1/#2/#3 badges), plus an overlay chart, an error-by-time-of-day chart, and (for trajectory sensors) a per-horizon error curve. Unit-aware, with a per-interval ↔ cumulative toggle; sources stay provisional until they have 7 days of overlap. Scoring runs once the experiment is in production. See *Configuration reference → External forecast comparison*.
   - **Predictions** and **Covariate Analysis.** Forecast-trace overlay and an automatic search across covariate combinations to identify which signals genuinely improve forecasts.
 - **System page.** CPU-core / nice-priority controls (actually applied) and a global "Run all benchmarks" trigger.
 
@@ -478,7 +484,7 @@ Notes and limits:
 - Only branches of this repository can be run — you supply a branch name, never a URL.
 - The bundled image is never modified; the overlay lives in `/data` and is removed on revert.
 - First fetch needs internet access on the Pi.
-- **New dependencies:** if a branch adds Python packages (e.g. the foundation-model backends' `chronos-forecasting` / `granite-tsfm`), only the genuinely-new ones are installed into the running environment before the restart — existing packages are left as the image built them. This step can take a few minutes and is **skipped on 32-bit ARM** (`armv7l`), which has no wheels for the compiled stack; those backends stay unavailable there. Dependencies installed this way persist across restarts but are wiped by an add-on update/rebuild — re-fetch the branch to reinstall. (For a permanent install, the dependency belongs in `requirements.txt` and a normal release.)
+- **New dependencies:** if a branch adds Python packages (e.g. the foundation-model backends' `chronos-forecasting` / `granite-tsfm`), only the genuinely-new ones are installed into the running environment before the restart — existing packages are left as the image built them. This step can take a few minutes and is **skipped on 32-bit ARM** (`armv7l`), which has no wheels for the compiled stack; those backends stay unavailable there. Dependencies installed this way persist across restarts but are wiped by an app update/rebuild — re-fetch the branch to reinstall. (For a permanent install, the dependency belongs in `requirements.txt` and a normal release.)
 - Requires the Supervisor API (`hassio_api`), used solely to restart the app after install/revert.
 
 ---
@@ -497,15 +503,23 @@ Check the app log for `[HA]` errors. The most common causes:
 - The experiment is still in `mode: lab`. Promotion in the UI also flips the mode; if you changed YAML by hand, make sure `mode: production` is set.
 - A sensor name collision. The first publish logs `Publishing forecast for <name>: base=sensor.mlfl_<name>` — check the actual entity ID and search HA's developer tools.
 
-### Conformal bands missing from the published sensors
+### Forecast sensors unavailable after a restart
 
-`_upper_<pct>` / `_lower_<pct>` only publish once enough residuals have been calibrated (default 10 deployed predictions whose actuals have arrived). Until then the Forecast Accuracy tab shows a countdown ("Calibrating · 4 of 10 residuals · ~3 h to bands"). After ~3 forecast cycles in production the bands should appear.
+Since v2.52.7 they should be back within a couple of minutes of Home Assistant or the app starting. If one stays unavailable, look in the app log for:
+
+- `Retrying the retrain for <name>` — Home Assistant wasn't answering; `Retrying the forecast for <name>` — the forecast's data couldn't be fetched or its sensors couldn't be posted. The app retries after 2, 5 and 15 minutes, then hourly or on the normal schedule if that is sooner.
+- `Retrain failed for <name>` without a retry line — training itself failed; the experiment's card shows the error.
+- `Timers for <name>: … retrain IMMEDIATELY (no cached model)` — there was no saved model, so the sensors appear once that retrain finishes.
+
+### Conformal bands show "unknown"
+
+`_upper_<pct>` / `_lower_<pct>` show `unknown` until enough residuals have been calibrated (default 10 deployed predictions whose actuals have arrived). Until then the Forecast Accuracy tab shows a countdown ("Calibrating · 4 of 10 residuals · ~3 h to bands"). After ~3 forecast cycles in production the bands should appear.
 
 If they vanished after a retrain: v2.24.0 had a regression where the conformal query filtered too strictly to the fresh model version. Upgrade to v2.27 or later, which falls back to pooled residuals during cold-start.
 
 ### Repairs shows "The unit has changed" for an `mlfl_` sensor
 
-Home Assistant raises this repair when a sensor's unit no longer matches the unit its long-term statistics were recorded in. Before v2.52.5 a restart could publish the forecast sensors without a unit for up to a day. Update the app and choose **Close**: the repair clears itself at Home Assistant's next hourly statistics check once the sensor carries its unit again.
+Home Assistant raises this repair when a sensor's unit no longer matches the unit its long-term statistics were recorded in. Before v2.52.6 a restart could publish the forecast sensors without a unit for up to a day. Update the app and choose **Close**: the repair clears itself at Home Assistant's next hourly statistics check once the sensor carries its unit again.
 
 Don't use **Fix issue** for this case. "Update the unit…" rewrites the stored unit to the empty one, so the same repair returns in reverse once the unit is back. "Delete all old statistic data" discards the sensor's statistics. If you changed the target sensor's unit on purpose, the repair is genuine. To pin the unit whatever the target reports, set `units:` on the experiment in `mlfl.yaml`.
 

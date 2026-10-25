@@ -32,23 +32,40 @@ ENTITY = "sensor.pv_power"
 class _StubHA:
     """Captures set_state payloads; serves a mutable source unit and state.
 
-    ``state=None`` is a target absent from HA (``HAInterface.get_state``
-    swallows the 404 and returns ``default``).
+    ``state=None`` is a target absent from HA (``HAInterface`` swallows the
+    404: ``get_state_object`` returns None, ``get_state`` returns
+    ``default``). ``fail_reads`` makes that many state-object reads fail the
+    same way, as a request that exhausts ``api_call``'s retries does.
     """
 
     def __init__(self, unit="kW", state="1.0"):
         self.unit = unit
         self.state = state
         self.raise_on_get = False
+        self.fail_reads = 0
         self.captured: list = []
 
     async def set_state(self, entity_id, state, attributes=None):
         self.captured.append((entity_id, state, attributes or {}))
         return True
 
+    async def get_state_object(self, entity_id):
+        if self.raise_on_get:
+            raise RuntimeError("simulated HA failure")
+        if self.fail_reads:
+            self.fail_reads -= 1
+            return None
+        if self.state is None:
+            return None
+        attrs = {} if self.unit is None else {"unit_of_measurement": self.unit}
+        return {"state": self.state, "attributes": attrs}
+
     async def get_state(self, entity_id, default=None, attribute=None):
         if self.raise_on_get:
             raise RuntimeError("simulated HA failure")
+        if self.fail_reads:
+            self.fail_reads -= 1
+            return default
         if self.state is None:
             return default
         if attribute == "unit_of_measurement":
@@ -133,6 +150,21 @@ class TestInconclusiveLookupIsNotCached:
         assert ENTITY not in app._source_unit_cache
         ha.raise_on_get = False
         assert _publish(app) == {"kW"}
+
+    def test_failed_read_keeps_known_unit_and_saved_fallback(self, tmp_path):
+        """v2.52.6: the unit and the state come from one response. With two
+        reads, a failed unit read followed by a good state read was taken
+        for a unitless source: "" was cached and the saved unit erased."""
+        path = tmp_path / "source_units.json"
+        ha = _StubHA(unit="kW")
+        app = _make_app(ha, path)
+        assert _publish(app) == {"kW"}
+
+        _retrain(app)
+        ha.fail_reads = 1
+        assert _publish(app) == {"kW"}
+        assert app._source_unit_last_good == {ENTITY: "kW"}
+        assert json.loads(path.read_text()) == {ENTITY: "kW"}
 
     def test_present_unitless_target_is_cached_empty(self):
         app = _make_app(_StubHA(unit=None, state="12.5"))

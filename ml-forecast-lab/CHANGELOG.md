@@ -1,25 +1,80 @@
 # Changelog
 
+## 2.52.7
+
+### Fixed
+
+**Forecast sensors come back within minutes after a restart.**
+
+- After restarting Home Assistant, the app's sensors could be unavailable
+  for up to half an hour; after a reboot, an experiment could have no
+  forecasts for up to a day.
+- The app now starts once Home Assistant is running and forecasts within
+  two minutes.
+- If Home Assistant restarts, the app puts its sensors back within about a
+  minute, and retries within minutes when Home Assistant isn't ready.
+- The last-run sensor comes back too; the last-retrain and last-benchmark
+  sensors return at the next retrain or benchmark, so automations on them
+  don't fire for one that didn't happen.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**The cumulative and band sensors no longer disappear.**
+
+- The cumulative sensor was left out whenever a forecast dipped below zero,
+  and the upper and lower band sensors until enough history had built up,
+  so a restart removed them.
+- They now show "unknown", with a `status` attribute saying why.
+- For forecasts that can't go below zero, such as solar power, set
+  `target_is_nonnegative: true` so the cumulative sensor gets a value; it
+  takes effect at the next retrain and also trains solar experiments with
+  every night-time reading set to zero, so their forecasts can shift.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**Sensors from renamed or lab experiments are removed.**
+
+- After renaming an experiment's sensors, changing its band coverage or
+  switching it to lab, the old sensors kept their last values until Home
+  Assistant restarted.
+- The app now removes them: within about two minutes for an experiment
+  switched to lab or deleted, and at the next retrain when its sensor names
+  or band coverage change.
+- It only removes sensors it created itself, from this version on.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**The dashboard and the last-benchmark sensor stay accurate.**
+
+- Benchmarks run from the Training tab now update the last-benchmark
+  sensor; before, only scheduled lab benchmarks did.
+- After a restart, an experiment with a trained model but no saved
+  benchmark showed "Pending" and no model on its dashboard card; it now
+  shows its model.
+
+## 2.52.6
+
+### Fixed
+
+**A brief connection problem no longer removes the forecast sensors' unit.**
+
+- In 2.52.5, a hiccup while Home Assistant was restarting could still leave
+  the forecast sensors without a unit until the next retrain.
+- That brought back the "The unit has changed" repair.
+- The app now keeps the last known unit whenever it can't read the sensor.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
+
 ## 2.52.5
 
 ### Fixed
 
-**Forecast sensors keep their unit after a restart.** After a host reboot,
-Home Assistant could show a "The unit has changed" repair for the
-`sensor.mlfl_*` sensors (from the source's unit, e.g. `kW`, to `''`), and
-their long-term statistics had a gap. With `units` left blank the add-on
-copies the target sensor's unit, but it only remembered that unit in memory.
-If the first publish after a restart found the target missing from Home
-Assistant, the sensors were published without a unit until the next
-retrain, up to a day later. A sensor created over the REST API, such as
-Predbat's `predbat.pv_power`, is removed by a Home Assistant restart until
-its publisher posts it again. The last resolved unit is now saved and
-reused while the target is missing or unavailable. A lookup that finds no
-target is retried at the next publish instead of being kept. A target that
-is present but has no unit still publishes without one. An existing repair
-clears itself within a couple of hours of updating: choose **Close**, not
-**Fix issue**. Details:
-[docs/investigations/2026-10-unit-repairs-after-restart.md](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md).
+**Forecast sensors keep their unit after a restart.**
+
+- After rebooting, Home Assistant could show a "The unit has changed" repair
+  for the app's forecast sensors, and their statistics had a gap.
+- This mostly affected experiments that forecast a sensor from another
+  app.
+- The app now remembers each sensor's unit across restarts.
+- If Home Assistant shows this repair, choose **Close** rather than **Fix
+  issue**; it clears itself within a couple of hours.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
 
 ## 2.52.4
 

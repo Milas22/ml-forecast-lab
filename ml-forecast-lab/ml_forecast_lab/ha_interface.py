@@ -31,6 +31,21 @@ DEFAULT_RETRIES = 2
 RETRY_BACKOFF_BASE = 1.0
 
 
+class HAUnavailableError(RuntimeError):
+    """v2.52.7: HA could not be reached, or kept answering 5xx, through
+    every ``api_call`` attempt — as while Core restarts or before it is
+    running. Callers use it to retry soon instead of on their normal
+    cadence."""
+
+
+class HAResponseError(RuntimeError):
+    """v2.52.7: HA answered with a 4xx status, held in ``status``."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 def parse_timestamp(ts_string: str) -> datetime:
     """
     Parse ISO8601 timestamp string from Home Assistant.
@@ -271,7 +286,10 @@ class HAInterface:
             Response JSON or text
 
         Raises:
-            RuntimeError: For HTTP errors or connection issues
+            HAResponseError: HA answered 4xx (a RuntimeError)
+            HAUnavailableError: every attempt failed to connect, timed out
+                or got 5xx (a RuntimeError)
+            RuntimeError: the session is not initialised
         """
         if not self.session or self.session.closed:
             raise RuntimeError("Session not initialised or closed")
@@ -305,8 +323,9 @@ class HAInterface:
                     error_text = await resp.text()
                     # 4xx is a client contract error — retrying won't help.
                     if resp.status < 500:
-                        raise RuntimeError(
-                            f"HA API error {resp.status}: {error_text[:200]}"
+                        raise HAResponseError(
+                            resp.status,
+                            f"HA API error {resp.status}: {error_text[:200]}",
                         )
                     # 5xx: treat as transient.
                     last_err = RuntimeError(
@@ -326,7 +345,7 @@ class HAInterface:
                 )
                 await asyncio.sleep(delay)
 
-        raise RuntimeError(
+        raise HAUnavailableError(
             f"HA {method} {endpoint} failed after {attempts} attempts: {last_err}"
         ) from last_err
 
@@ -423,6 +442,53 @@ class HAInterface:
         except RuntimeError:
             logger.warning(f"Entity not found: {entity_id}")
             return default
+
+    async def get_state_object(self, entity_id: str) -> Optional[dict]:
+        """Return an entity's full state object, or None if it can't be read.
+
+        v2.52.6: one request, so a caller can read ``state`` and
+        ``attributes`` from the same response. Two ``get_state`` calls
+        cannot tell a missing attribute from a failed request, and HA can
+        change between them. None covers a 404 and any request that fails
+        after ``api_call``'s retries.
+        """
+        try:
+            state_obj = await self.api_call("GET", f"/api/states/{entity_id}")
+        except RuntimeError as e:
+            logger.debug(f"Could not read state of {entity_id}: {e}")
+            return None
+        return state_obj if isinstance(state_obj, dict) else None
+
+    async def entity_exists(self, entity_id: str) -> Optional[bool]:
+        """Whether HA currently has a state for *entity_id*.
+
+        v2.52.7: True on 200, False on 404, None when HA is unreachable or
+        answers anything else. One attempt and no warning on failure, so a
+        once-a-minute check stays silent while HA is down.
+        """
+        try:
+            await self.api_call("GET", f"/api/states/{entity_id}", retries=0)
+        except HAResponseError as e:
+            return False if e.status == 404 else None
+        except RuntimeError:
+            return None
+        return True
+
+    async def delete_state(self, entity_id: str) -> Optional[bool]:
+        """Remove *entity_id*'s state from HA (``DELETE /api/states``).
+
+        v2.52.7: True when removed, False when HA had no such state, None
+        when HA is unreachable. Any other 4xx raises ``HAResponseError``.
+        """
+        try:
+            await self.api_call("DELETE", f"/api/states/{entity_id}")
+        except HAResponseError as e:
+            if e.status == 404:
+                return False
+            raise
+        except RuntimeError:
+            return None
+        return True
 
     async def get_last_updated(
         self,

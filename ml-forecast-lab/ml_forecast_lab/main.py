@@ -30,6 +30,33 @@ logger = logging.getLogger(__name__)
 # the user can select. Pruned per-experiment on the retrain cadence.
 FORECAST_LOG_RETENTION_DAYS = 120
 
+# v2.52.7: retry delays (minutes) after a retrain or forecast failed because
+# HA was unreachable — Core restarting, or the app starting first. Indexed
+# by consecutive failures, the last repeating; never later than the normal
+# cadence.
+HA_RETRY_MINUTES = (2, 5, 15, 60)
+# v2.52.7: settle time before the first forecast after the app starts, so
+# integrations still loading after an HA start can provide covariates.
+STARTUP_FORECAST_DELAY_SECONDS = 120
+# v2.52.7: how often the app checks that HA still holds its sensors. HA
+# does not restore REST-posted states, so after a Core restart they are
+# missing until posted again.
+HA_STATES_CHECK_SECONDS = 60
+HEARTBEAT_ENTITY = "sensor.mlfl_last_run"
+
+
+def _ha_unavailable(exc: Optional[BaseException]) -> bool:
+    """True when *exc*, or an exception it was raised from, is
+    ``HAUnavailableError``."""
+    from ml_forecast_lab.ha_interface import HAUnavailableError
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, HAUnavailableError):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 def _resolve_output_activation(exp_cfg, model_name: str = '') -> str:
     """
@@ -1169,6 +1196,38 @@ class MLForecastLabApp:
         # and later the one that finishes first would flip the flag False
         # while the other was still running — breaking the guarantee.
         self._forecast_running: Dict[str, bool] = {}
+        # Per-experiment schedule; main_loop fills it. Created here so the
+        # retry paths can reschedule before main_loop has run.
+        self._next_forecast_per_exp: Dict[str, datetime] = {}
+        self._next_retrain_per_exp: Dict[str, datetime] = {}
+        # v2.52.7: consecutive failures per experiment, indexing
+        # HA_RETRY_MINUTES; reset on success.
+        self._retrain_ha_failures: Dict[str, int] = {}
+        self._forecast_failures: Dict[str, int] = {}
+        # v2.52.7: last payloads posted per experiment, re-posted as-is when
+        # HA loses the app's states.
+        self._last_payloads: Dict[str, list] = {}
+        # v2.52.7: time of the last successful forecast or retrain, and the
+        # value HEARTBEAT_ENTITY was last posted with. Only _check_ha_states
+        # posts the heartbeat, so nothing else can re-create it after an HA
+        # restart and hide the loss.
+        self._last_success_at: Optional[datetime] = None
+        self._heartbeat_posted_at: Optional[datetime] = None
+        # v2.52.7: whether HA was last seen holding HEARTBEAT_ENTITY; None
+        # until the first check.
+        self._ha_states_seen: Optional[bool] = None
+        self._next_states_check: Optional[datetime] = None
+        self._states_check_running = False
+        # v2.52.7: every entity id the app has posted, with its experiment,
+        # mirrored to _published_entities_path (set by run(); None in tests)
+        # so sensors of renamed, removed or lab experiments can be removed.
+        self._published_entities: Dict[str, str] = {}
+        self._published_entities_path: Optional[Path] = None
+        self._orphan_candidates: set = set()
+        self._orphan_cleanup_disabled = False
+        # v2.52.7: True while self.config is the stub used when no config
+        # file was found — never a basis for removing sensors.
+        self._config_is_stub = False
         self.last_update = None
         self.benchmarks_to_run = set()
         # Cached trained models for fast forecast cycles
@@ -1298,6 +1357,7 @@ class MLForecastLabApp:
             )
             logger.info("Creating stub configuration...")
             self.config = self._create_stub_config()
+            self._config_is_stub = True
         else:
             try:
                 from ml_forecast_lab.config import load_config
@@ -1327,6 +1387,7 @@ class MLForecastLabApp:
                 self._last_config_path = found_path
                 self._last_config_mtime = current_mtime
                 self.config = new_config
+                self._config_is_stub = False
             except Exception as e:
                 if self.config is not None:
                     # Periodic reload failed — keep the existing good config
@@ -1340,6 +1401,7 @@ class MLForecastLabApp:
                     # First load — no config to fall back to
                     logger.error(f"Failed to load configuration: {e}", exc_info=True)
                     self.config = self._create_stub_config()
+                    self._config_is_stub = True
 
     def _create_stub_config(self):
         """Create a minimal stub configuration for testing."""
@@ -1529,11 +1591,22 @@ class MLForecastLabApp:
                             exp_cfg = cfg
                             break
                     if exp_cfg:
+                        started_at = datetime.now(timezone.utc)
                         try:
                             self.web_app.state.appstate.start_benchmark(experiment_name)
-                            await self._run_benchmark(exp_cfg)
+                            ran = await self._run_benchmark(exp_cfg)
                         except Exception as e:
                             logger.error(f"Benchmark failed: {e}", exc_info=True)
+                            # v2.52.7: the Training-tab benchmark never posted
+                            # _last_benchmark; only the lab-mode cycle did.
+                            await self._publish_lifecycle_sensor(
+                                exp_cfg, "benchmark", "failed",
+                                {"error": str(e)[:200]},
+                            )
+                        else:
+                            await self._publish_benchmark_outcome(
+                                exp_cfg, started_at, ran,
+                            )
                         finally:
                             self.web_app.state.appstate.end_benchmark(experiment_name)
                             self._running_tasks.pop(experiment_name, None)
@@ -1666,7 +1739,7 @@ class MLForecastLabApp:
                 async with self._training_lock:
                     try:
                         await self._retrain_and_cache(exp_cfg)
-                        await self.publish_heartbeat()
+                        self._note_success()
                     except Exception as e:
                         logger.error(
                             f"Retrain trigger failed for {experiment_name}: {e}",
@@ -1812,8 +1885,9 @@ class MLForecastLabApp:
                 return
 
             _started_at = datetime.now(timezone.utc)
+            ran = None
             if is_lab_mode:
-                await self._run_benchmark(exp_cfg)
+                ran = await self._run_benchmark(exp_cfg)
             else:
                 await self._run_production_inference(exp_cfg)
 
@@ -1830,15 +1904,7 @@ class MLForecastLabApp:
 
             # Publish lifecycle sensor for HA automations
             if is_lab_mode:
-                _duration = (datetime.now(timezone.utc) - _started_at).total_seconds()
-                _attrs = {"duration_seconds": round(_duration, 1)}
-                br = (self.web_app.state.appstate.benchmark_results.get(experiment_name)
-                      if self.web_app else None)
-                if br and getattr(br, "best_model_name", None):
-                    _attrs["winner"] = br.best_model_name
-                await self._publish_lifecycle_sensor(
-                    exp_cfg, "benchmark", "completed", _attrs,
-                )
+                await self._publish_benchmark_outcome(exp_cfg, _started_at, ran)
 
         except Exception as e:
             logger.error(
@@ -1967,21 +2033,19 @@ class MLForecastLabApp:
         conclusive = False
         if self.ha_interface:
             try:
-                fetched = await self.ha_interface.get_state(
-                    entity, attribute="unit_of_measurement", default=None,
-                )
-                if isinstance(fetched, str) and fetched.strip():
-                    unit = fetched.strip()
-                else:
-                    # get_state returns the same default for a missing
-                    # attribute, a 404 and an unreachable HA; the state
-                    # tells them apart.
-                    state = await self.ha_interface.get_state(
-                        entity, default=None,
-                    )
-                    conclusive = state not in (
-                        None, "", "unknown", "unavailable",
-                    )
+                # v2.52.6: unit and state from ONE response. Two get_state
+                # calls classified a failed unit read followed by a good
+                # state read as "unitless", erasing a known unit.
+                state_obj = await self.ha_interface.get_state_object(entity)
+                if isinstance(state_obj, dict):
+                    attrs = state_obj.get("attributes") or {}
+                    fetched = attrs.get("unit_of_measurement")
+                    if isinstance(fetched, str) and fetched.strip():
+                        unit = fetched.strip()
+                    else:
+                        conclusive = state_obj.get("state") not in (
+                            None, "", "unknown", "unavailable",
+                        )
             except Exception as e:
                 logger.debug(
                     f"  Could not auto-resolve unit from {entity}: {e}"
@@ -3897,7 +3961,9 @@ class MLForecastLabApp:
         # 1. Fetch and preprocess data
         df = await self._fetch_and_preprocess(exp_cfg)
         if df is None:
-            return
+            # v2.52.7: reported so _last_benchmark isn't posted "completed"
+            # for a benchmark that never ran.
+            return False
 
         # Count measured labels, not grid slots. `_fetch_and_preprocess`
         # now returns the complete grid, so `len(df)` includes rows that can
@@ -4854,6 +4920,7 @@ class MLForecastLabApp:
             experiment_name=exp_cfg.name,
             message=f"Benchmark complete — best model: {best_model_name}",
         ))
+        return True
 
     @staticmethod
     def _build_window_channels(df_slice, cov_cols, target_col='target'):
@@ -5493,8 +5560,7 @@ class MLForecastLabApp:
                 is_lab = exp_cfg.mode == "lab"
                 await self.update_experiment(exp_cfg.name, is_lab)
 
-            # Publish heartbeat
-            await self.publish_heartbeat()
+            self._note_success()
 
             logger.info(
                 f"Update cycle completed. Next update at {next_update.isoformat()}"
@@ -5520,6 +5586,7 @@ class MLForecastLabApp:
     async def _retrain_single(self, exp_cfg):
         """Retrain a single experiment (per-experiment timer)."""
         self._update_running = True
+        cleared_entry = None
         try:
             # Invalidate stale cache when the production model changes.
             # Without this, intermediate forecast cycles between config
@@ -5535,13 +5602,14 @@ class MLForecastLabApp:
                         f"  Production model changed ({cached_model} → {wanted_model})"
                         f" — clearing stale cache for {exp_cfg.name}"
                     )
-                    del self._cached_models[exp_cfg.name]
+                    cleared_entry = self._cached_models.pop(exp_cfg.name)
 
             if exp_cfg.mode == "lab":
                 await self.update_experiment(exp_cfg.name, is_lab_mode=True)
             else:
                 await self._retrain_and_cache(exp_cfg)
-            await self.publish_heartbeat()
+            self._retrain_ha_failures.pop(exp_cfg.name, None)
+            self._note_success()
 
             # Age-based forecast_log retention (audit F5). Before
             # v2.41.0 the log was only pruned on champion change, so a
@@ -5601,6 +5669,25 @@ class MLForecastLabApp:
                     )
         except Exception as e:
             logger.error(f"Retrain failed for {exp_cfg.name}: {e}", exc_info=True)
+            # v2.52.7: a failed replacement must not leave the experiment
+            # with no model to forecast with until the next retrain.
+            if cleared_entry is not None and exp_cfg.name not in self._cached_models:
+                self._cached_models[exp_cfg.name] = cleared_entry
+                logger.warning(
+                    f"  Keeping the previous {cleared_entry.get('model_name')} "
+                    f"for {exp_cfg.name} until a retrain succeeds"
+                )
+            # v2.52.7: HA unreachable (Core restarting, or the app started
+            # first) — retry within minutes, not after retrain_every_hours.
+            if _ha_unavailable(e):
+                rt_hrs = (
+                    exp_cfg.retrain_every_hours
+                    or (self.config.retrain_every_hours if self.config else 24.0)
+                )
+                self._schedule_retry(
+                    exp_cfg.name, "retrain", self._next_retrain_per_exp,
+                    self._retrain_ha_failures, timedelta(hours=rt_hrs),
+                )
             # Surface the error in the web UI so the user doesn't have to
             # dig through log files to find out what went wrong.
             if self.web_app:
@@ -5658,9 +5745,17 @@ class MLForecastLabApp:
             if exp_cfg.name not in self._cached_models:
                 logger.debug(f"  No cached model for {exp_cfg.name} — waiting for retrain")
                 return
-            await self._forecast_with_cached(exp_cfg.name)
+            outcome = await self._forecast_with_cached(exp_cfg.name)
+            if outcome == "ok":
+                self._forecast_failures.pop(exp_cfg.name, None)
+                self._note_success()
+            elif outcome in ("no_frame", "publish_failed"):
+                # v2.52.7: HA unreachable for the fetch or the posts.
+                self._schedule_forecast_retry(exp_cfg)
         except Exception as e:
             logger.error(f"Forecast failed for {exp_cfg.name}: {e}", exc_info=True)
+            if _ha_unavailable(e):
+                self._schedule_forecast_retry(exp_cfg)
             if self.web_app:
                 status = self.web_app.state.appstate.experiment_statuses.get(
                     exp_cfg.name
@@ -5670,6 +5765,233 @@ class MLForecastLabApp:
                     status.last_error = f"Forecast: {e}"
         finally:
             self._forecast_running[exp_cfg.name] = False
+
+    def _schedule_retry(
+        self, name: str, what: str, schedule: dict, failures: dict,
+        cadence: timedelta,
+    ) -> None:
+        """v2.52.7: bring *name*'s next *what* forward after a failure.
+
+        The delay follows ``HA_RETRY_MINUTES`` by consecutive failures and
+        never exceeds *cadence*, so a lasting fault settles back onto the
+        normal schedule. An earlier scheduled run is left alone.
+        """
+        n = failures.get(name, 0) + 1
+        failures[name] = n
+        minutes = HA_RETRY_MINUTES[min(n, len(HA_RETRY_MINUTES)) - 1]
+        delay = min(timedelta(minutes=minutes), cadence)
+        retry_at = datetime.now(timezone.utc) + delay
+        current = schedule.get(name)
+        if current is None or retry_at < current:
+            schedule[name] = retry_at
+            logger.info(
+                f"  Retrying the {what} for {name} in "
+                f"{delay.total_seconds() / 60:.0f} min"
+            )
+
+    def _schedule_forecast_retry(self, exp_cfg) -> None:
+        fc_mins = (
+            exp_cfg.forecast_every_minutes
+            or (self.config.forecast_every_minutes if self.config else 30)
+        )
+        self._schedule_retry(
+            exp_cfg.name, "forecast", self._next_forecast_per_exp,
+            self._forecast_failures, timedelta(minutes=fc_mins),
+        )
+
+    @staticmethod
+    def _forecast_entities(exp_cfg) -> set:
+        """The forecast-family ids posted under *exp_cfg* (bands at its
+        ``conformal_coverage`` level, ``_interval`` for cumulative sources)."""
+        publish_name = exp_cfg.publish_name or exp_cfg.name
+        base = f"sensor.{exp_cfg.publish_prefix}{publish_name}"
+        pct = int(round(float(getattr(exp_cfg, "conformal_coverage", 0.8)) * 100))
+        ids = {
+            f"{base}_forecast", f"{base}_cumulative", f"{base}_upper_{pct}",
+            f"{base}_lower_{pct}", f"{base}_forecast_accuracy",
+        }
+        if exp_cfg.source_is_cumulative:
+            ids.add(f"{base}_interval")
+        return ids
+
+    @staticmethod
+    def _lifecycle_entities(exp_cfg) -> set:
+        life = f"sensor.{exp_cfg.publish_prefix or 'mlfl_'}{exp_cfg.publish_name or exp_cfg.name}"
+        return {f"{life}_last_retrain", f"{life}_last_benchmark"}
+
+    def _live_forecast_entities(self, exp_cfg) -> set:
+        """Forecast ids a production experiment may post now: forecasts
+        publish with the ``exp_cfg`` cached at the last retrain, so a
+        renamed ``publish_name`` or changed ``conformal_coverage`` only
+        moves to the new ids at the next retrain."""
+        ids = self._forecast_entities(exp_cfg)
+        cached_cfg = (self._cached_models.get(exp_cfg.name) or {}).get("exp_cfg")
+        if cached_cfg is not None:
+            ids |= self._forecast_entities(cached_cfg)
+        return ids
+
+    def _record_published(self, exp_name: str, entity_ids: list) -> None:
+        """Remember which experiment posted each id; persisted on change."""
+        changed = False
+        for eid in entity_ids:
+            if self._published_entities.get(eid) != exp_name:
+                self._published_entities[eid] = exp_name
+                changed = True
+        if changed:
+            self._persist_published_entities()
+
+    def _persist_published_entities(self) -> None:
+        import json
+        path = self._published_entities_path
+        if path is None:
+            return
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                self._published_entities, indent=2, sort_keys=True,
+            ))
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"  Could not save published sensor list to {path}: {e}")
+
+    def _restore_published_entities(self) -> None:
+        """v2.52.7: reload the ids a previous run posted."""
+        import json
+        path = self._published_entities_path
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except Exception as e:
+            logger.warning(f"  Could not read published sensor list from {path}: {e}")
+            return
+        if isinstance(data, dict):
+            self._published_entities.update({
+                k: v for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, str)
+            })
+
+    async def _retire_orphaned_sensors(self) -> None:
+        """v2.52.7: remove sensors the app posted but no longer produces.
+
+        An experiment switched to lab or removed (its forecast ids), or one
+        whose ``publish_name``/``publish_prefix``/``conformal_coverage``
+        changed (its old ids, once the next retrain moves its forecasts to
+        the new ones): the old ids used to keep their last value until HA
+        restarted. The ``_last_<event>`` ids stay while the experiment
+        exists, whatever its mode. An id
+        is removed once it has been unexpected in two consecutive checks,
+        so a config reload caught mid-write can't remove live sensors; never
+        while the config is the no-file stub or lists no experiments. Only
+        ids this app recorded posting are touched.
+        """
+        if (self._orphan_cleanup_disabled or self._config_is_stub
+                or not self._published_entities
+                or not self.config or not self.config.experiments):
+            return
+        from ml_forecast_lab.ha_interface import HAResponseError
+        expected = set()
+        for e in self.config.experiments:
+            expected |= self._lifecycle_entities(e)
+            if e.mode == "production":
+                expected |= self._live_forecast_entities(e)
+        candidates = {eid for eid in self._published_entities if eid not in expected}
+        due = candidates & self._orphan_candidates
+        self._orphan_candidates = candidates - due
+        removed = []
+        for eid in sorted(due):
+            try:
+                result = await self.ha_interface.delete_state(eid)
+            except HAResponseError as e:
+                logger.warning(
+                    f"Home Assistant refused to remove {eid} ({e}); "
+                    f"leaving sensors the app no longer posts in place"
+                )
+                self._orphan_cleanup_disabled = True
+                return
+            if result is None:
+                self._orphan_candidates.add(eid)  # unreachable: next check
+                continue
+            self._published_entities.pop(eid, None)
+            if result:
+                removed.append(eid)
+        if due:
+            self._persist_published_entities()
+        if removed:
+            logger.info(
+                f"Removed {len(removed)} sensor(s) the app no longer posts: "
+                f"{', '.join(removed)}"
+            )
+
+    async def _check_ha_states(self) -> None:
+        """v2.52.7: re-post the app's sensors when HA has lost them.
+
+        HA does not restore states POSTed over its REST API, so a Core
+        restart removes every ``sensor.mlfl_*`` until it is posted again —
+        up to a full forecast cadence. Only this check posts
+        ``HEARTBEAT_ENTITY`` (stamped with the last successful forecast or
+        retrain), so nothing else can re-create it first: once seen, its
+        absence means HA dropped the app's states, and the last payloads of
+        current production experiments are re-posted at once. The
+        ``_last_<event>`` sensors are left to their next real event —
+        re-creating one fires state-triggered automations for an event
+        that didn't happen.
+        """
+        try:
+            if not self.ha_interface:
+                return
+            exists = await self.ha_interface.entity_exists(HEARTBEAT_ENTITY)
+            if exists is None:
+                return
+            await self._retire_orphaned_sensors()
+            if not exists and self._ha_states_seen:
+                await self._repost_last_payloads()
+                self._heartbeat_posted_at = None
+            stamp = self._last_success_at
+            if stamp is not None and (
+                not exists or self._heartbeat_posted_at != stamp
+            ):
+                if await self._post_heartbeat(stamp):
+                    self._heartbeat_posted_at = stamp
+                    self._ha_states_seen = True
+            elif exists:
+                self._ha_states_seen = True
+        except Exception as e:
+            logger.warning(f"Checking Home Assistant for the app's sensors failed: {e}")
+        finally:
+            self._states_check_running = False
+
+    async def _repost_last_payloads(self) -> None:
+        """Re-post each current production experiment's last forecast
+        payloads, limited to the ids it still produces. Skips experiments
+        whose forecast is running, which posts fresher values itself. One
+        attempt: a failure is restored by that experiment's next forecast.
+        """
+        experiments = [
+            e for e in (self.config.experiments if self.config else [])
+            if e.mode == "production"
+            and not self._forecast_running.get(e.name, False)
+        ]
+        payloads = []
+        n_exps = 0
+        for e in experiments:
+            expected = self._live_forecast_entities(e)
+            mine = [p for p in self._last_payloads.get(e.name, []) if p[0] in expected]
+            if mine:
+                n_exps += 1
+                payloads += mine
+        if not payloads:
+            return
+        results = await asyncio.gather(*[
+            self.ha_interface.set_state(eid, state, attrs)
+            for eid, state, attrs in payloads
+        ], return_exceptions=True)
+        ok = sum(1 for r in results if r is True)
+        logger.info(
+            f"Home Assistant no longer had the app's sensors (it restarted); "
+            f"re-posted {ok}/{len(payloads)} from the last forecasts of "
+            f"{n_exps} experiment(s)"
+        )
 
     async def _run_retrain_cycle(self):
         """[Legacy] Bulk retrain for all experiments (kept for backward compat)."""
@@ -5687,7 +6009,7 @@ class MLForecastLabApp:
                     except Exception as e:
                         logger.error(f"Retrain failed for {exp_cfg.name}: {e}", exc_info=True)
 
-            await self.publish_heartbeat()
+            self._note_success()
             logger.info("=== Retrain cycle completed ===")
         except Exception as e:
             logger.error(f"Error in retrain cycle: {e}", exc_info=True)
@@ -6262,17 +6584,8 @@ class MLForecastLabApp:
                 entry = _cache_entry_from_meta(meta, model, exp_cfg)
                 trained_at = entry["trained_at"]
                 self._cached_models[exp_cfg.name] = entry
-                # Also mirror into web status so the UI reflects the
-                # restored champion immediately, not "unknown" until the
-                # next retrain writes one.
-                if self.web_app:
-                    status = self.web_app.state.appstate.experiment_statuses.get(
-                        exp_cfg.name
-                    )
-                    if status:
-                        status.best_model = model_name
-                        status.model_version = meta["model_version"]
-                        status.last_benchmark_timestamp = meta["trained_at"]
+                # The dashboard is updated by _sync_restored_models_to_ui
+                # once the web app exists (it doesn't yet at this point).
                 age_m = (datetime.now(timezone.utc) - trained_at).total_seconds() / 60
                 logger.info(
                     f"  Restored cached {model_name} for {exp_cfg.name} "
@@ -6291,6 +6604,35 @@ class MLForecastLabApp:
                 f"Restored {restored} cached production model(s) from disk — "
                 f"skipping immediate retrain for these experiments"
             )
+
+    def _sync_restored_models_to_ui(self) -> None:
+        """v2.52.7: show restored production models on the dashboard.
+
+        ``_restore_cached_models`` runs before the web app exists, so its
+        old status mirror never ran: an experiment with a restored model
+        but no saved benchmark result showed "Pending" and no model while
+        it forecast normally. Fills only what the saved benchmark left
+        unset; ``model_version`` is set only when ``best_model`` is the
+        deployed model.
+        """
+        if not self.web_app:
+            return
+        statuses = self.web_app.state.appstate.experiment_statuses
+        for name, entry in self._cached_models.items():
+            st = statuses.get(name)
+            if st is None:
+                continue
+            # model_version is the default analytics filter when the
+            # selected model is best_model, so it must belong to that model.
+            if not st.best_model:
+                st.best_model = entry.get("model_name")
+            if entry.get("model_version") and st.best_model == entry.get("model_name"):
+                st.model_version = entry["model_version"]
+            if st.last_benchmark_status == "pending":
+                st.last_benchmark_status = "completed"
+                trained_at = entry.get("trained_at")
+                if trained_at is not None and not st.last_benchmark_timestamp:
+                    st.last_benchmark_timestamp = trained_at.isoformat()
 
     def _rollback_cached_model(self, exp_name: str) -> tuple[bool, Optional[str]]:
         """Roll a regressive retrain back to the previous champion.
@@ -6690,7 +7032,7 @@ class MLForecastLabApp:
         y_pred_upper: Optional[np.ndarray] = None,
         y_pred_lower: Optional[np.ndarray] = None,
         interval_level: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         """Publish forecast sensors to Home Assistant.
 
         Always publishes:
@@ -6701,25 +7043,30 @@ class MLForecastLabApp:
           are both set, resets at local midnight and is seeded with the
           current target value so the curve stays continuous with actuals.
           Otherwise a running ``cumsum`` from zero across the horizon.
+        - ``_upper_{pct}`` / ``_lower_{pct}``: conformal interval bounds
+          (pct = level*100).
 
-        Conditionally publishes:
+        v2.52.7: a sensor with no value this cycle — ``_cumulative`` for
+        signed predictions, the bands before calibration — is posted as
+        ``unknown`` with a ``status`` attribute instead of being left out,
+        so it survives an HA restart and a dashboard can show why.
 
-        - ``_interval``: per-interval increments (only when
-          ``source_is_cumulative`` — otherwise duplicates ``_forecast``).
-        - ``_upper_{pct}`` / ``_lower_{pct}``: conformal interval bounds when
-          ``y_pred_upper`` / ``y_pred_lower`` are provided (pct = level*100).
+        Conditionally publishes ``_interval``: per-interval increments (only
+        when ``source_is_cumulative`` — otherwise duplicates ``_forecast``).
+
+        Returns True when every sensor post succeeded.
         """
         if not self.ha_interface:
             logger.warning(
                 f"  Skipping sensor publish for {exp_cfg.name}: no HA interface"
             )
-            return
+            return False
         if len(y_pred) == 0:
             logger.warning(
                 f"  Skipping sensor publish for {exp_cfg.name}: "
                 f"forecast array is empty"
             )
-            return
+            return False
 
         # The post-hoc "clear_sky_ghi = 0 → y_pred = 0" hard clamp from
         # v2.27.8 used to live here. It was removed in v2.27.9 after
@@ -6790,8 +7137,8 @@ class MLForecastLabApp:
         # is approximate; the realised-coverage diagnostic on the
         # Forecast Accuracy tab is the user-visible signal that the
         # bands need recalibrating. Cold-start returns no quantiles →
-        # bands stay absent until the residual buffer fills, which
-        # surfaces naturally as "point-only forecast" in the UI.
+        # bands are posted as unknown (v2.52.7) until the residual buffer
+        # fills, which surfaces as "point-only forecast" in the UI.
         # See DOCS.md "Conformal band calibration" for how the buffer
         # behaves across retrains.
         if (
@@ -6927,6 +7274,8 @@ class MLForecastLabApp:
         # the operator to guess between "failed" and "never attempted".
         payloads: list[tuple[str, str, dict]] = []
         skipped_sensors: list[tuple[str, str]] = []
+        # v2.52.7: sensors posted as unknown this cycle, with the reason.
+        unknown_sensors: list[tuple[str, str]] = []
 
         # --- 1. Main forecast sensor (always published) ----------------------
         main_attrs = {
@@ -7043,15 +7392,25 @@ class MLForecastLabApp:
             # Signed predictions (e.g. net battery flow with PV export):
             # cumsum can drift unboundedly negative or positive and the
             # published "_cumulative" sensor stops matching the user's
-            # mental model of the target. Skip cumulative entirely and
-            # record the skip so the system page makes the omission visible.
+            # mental model of the target. v2.52.7: posted as unknown with
+            # the reason rather than omitted, which left the entity
+            # missing after an HA restart.
             logger.debug(
-                "Skipping cumulative sensor for %s: signed predictions "
+                "No cumulative value for %s: signed predictions "
                 "(min=%.3f) would produce unbounded drift in HA.",
                 publish_name, float(np.min(y_pred)),
             )
-            skipped_sensors.append(("_cumulative", "signed_predictions"))
-            cum_attrs = None
+            cum_state = "unknown"
+            cum_attrs = {
+                "friendly_name": f"{publish_name} Cumulative Forecast",
+                "unit_of_measurement": units,
+                "icon": "mdi:chart-line-stacked",
+                "state_class": "measurement",
+                "status": "signed_predictions",
+                "resets_daily": False,
+                **common_attrs,
+            }
+            unknown_sensors.append(("_cumulative", "signed_predictions"))
         else:
             cum_vals = np.cumsum(y_pred)
             cum_list = [
@@ -7119,10 +7478,28 @@ class MLForecastLabApp:
         else:
             # Band sensors share the cold-start reason: either no
             # conformal quantiles are calibrated yet, or the residual
-            # query errored earlier in this cycle. The level defaults
-            # to 80 so the skip name matches what will eventually land.
-            skipped_sensors.append(("_upper_80", "no_conformal_bands"))
-            skipped_sensors.append(("_lower_80", "no_conformal_bands"))
+            # query errored earlier in this cycle. v2.52.7: posted as
+            # unknown under the configured level's ids, so the entities
+            # exist (and survive an HA restart) before the bands do.
+            level = float(getattr(exp_cfg, "conformal_coverage", 0.8))
+            lvl_pct = int(round(level * 100))
+            for side, icon in (("upper", "mdi:arrow-expand-up"),
+                               ("lower", "mdi:arrow-expand-down")):
+                payloads.append((
+                    f"{base_entity}_{side}_{lvl_pct}", "unknown",
+                    {
+                        "friendly_name": (
+                            f"{publish_name} Forecast {side.title()} {lvl_pct}%"
+                        ),
+                        "unit_of_measurement": units,
+                        "icon": icon,
+                        "state_class": "measurement",
+                        "interval_level": level,
+                        "status": "no_conformal_bands",
+                        **common_attrs,
+                    },
+                ))
+                unknown_sensors.append((f"_{side}_{lvl_pct}", "no_conformal_bands"))
 
         # --- 5. Forecast accuracy sensor (always published) -----------------
         # Publishes from day one so the HA entity exists in the registry
@@ -7241,6 +7618,9 @@ class MLForecastLabApp:
         results = await asyncio.gather(*[
             _publish_one(eid, s, a) for eid, s, a in payloads
         ])
+        # v2.52.7: kept for _check_ha_states to re-post after an HA restart.
+        self._last_payloads[exp_cfg.name] = payloads
+        self._record_published(exp_cfg.name, [eid for eid, _, _ in payloads])
 
         succeeded = [eid for eid, ok, _ in results if ok]
         failed = [(eid, err) for eid, ok, err in results if not ok]
@@ -7278,6 +7658,11 @@ class MLForecastLabApp:
         )
         if skipped_items:
             logger.info(f"    skipped: {', '.join(skipped_items)}")
+        if unknown_sensors:
+            logger.info(
+                "    unknown: "
+                + ", ".join(f"{suffix}({reason})" for suffix, reason in unknown_sensors)
+            )
         for eid, err in failed:
             reason = repr(err) if err else "set_state returned False"
             logger.warning(
@@ -7294,6 +7679,7 @@ class MLForecastLabApp:
                     f"Publish: {len(failed)}/{total_expected} sensors failed "
                     f"({', '.join(e.split('.')[-1] for e, _ in failed)})"
                 )
+        return not failed
 
     async def _compute_cached_forecast(
         self, cache: dict, now: Optional[datetime] = None,
@@ -7973,19 +8359,23 @@ class MLForecastLabApp:
 
     async def _forecast_with_cached(
         self, experiment_name: str, now: Optional[datetime] = None,
-    ):
+    ) -> str:
         """Run inference with a cached model and publish sensors.
 
         Fetches fresh recent data on each call so that lag features and
         timestamps are current, even though the model itself is cached
         from the last retrain cycle.
+
+        v2.52.7: returns the outcome — ``"ok"``, ``"publish_failed"`` (a
+        sensor post failed), ``"no_model"`` or the ``CachedForecast``
+        status that stopped it (``"no_frame"`` etc.).
         """
         cache = self._cached_models.get(experiment_name)
         if not cache:
-            return
+            return "no_model"
         fc = await self._compute_cached_forecast(cache, now=now)
         if fc.status != "ok":
-            return
+            return fc.status
         exp_cfg = fc.exp_cfg
 
         # Debug bundle: pair this forecast with the most recent training
@@ -8009,13 +8399,14 @@ class MLForecastLabApp:
             except Exception as e:
                 logger.debug(f"debug_dump forecast hook failed: {e}")
 
-        await self._publish_forecast_sensors(
+        published = await self._publish_forecast_sensors(
             exp_cfg=exp_cfg,
             y_pred=fc.y_pred,
             ds_future=fc.ds_future,
             model_name=fc.model_name,
             last_trained_iso=fc.last_trained.isoformat(),
         )
+        return "ok" if published else "publish_failed"
 
     async def _run_tuning(self, experiment_name: str, model_name: str,
                           n_trials: int = 30, strategy: str = "tpe",
@@ -9199,31 +9590,34 @@ class MLForecastLabApp:
         logger.info(f"  {'─' * 50}")
         logger.info(f"{'=' * 60}")
 
-    async def publish_heartbeat(self):
-        """
-        Publish heartbeat sensor to Home Assistant.
+    def _note_success(self) -> None:
+        """Record a successful forecast or retrain for the heartbeat.
 
-        Creates/updates a sensor.mlfl_last_run entity with the current timestamp.
+        v2.52.7: ``_check_ha_states`` posts ``sensor.mlfl_last_run`` with
+        this time within a minute. Posting it here instead would let any
+        experiment re-create it right after an HA restart and hide the loss
+        from the check.
         """
+        self._last_success_at = datetime.now(timezone.utc)
+
+    async def _post_heartbeat(self, stamp: datetime) -> bool:
+        """Post ``sensor.mlfl_last_run`` with *stamp*; True on success."""
         try:
             if not self.ha_interface:
-                return
-
-            timestamp = datetime.now(timezone.utc).isoformat()
-            logger.debug(f"Publishing heartbeat: {timestamp}")
-
-            await self.ha_interface.set_state(
-                "sensor.mlfl_last_run",
-                timestamp,
+                return False
+            logger.debug(f"Publishing heartbeat: {stamp.isoformat()}")
+            return bool(await self.ha_interface.set_state(
+                HEARTBEAT_ENTITY,
+                stamp.isoformat(),
                 attributes={
                     "friendly_name": "ML Forecast Lab Last Run",
                     "icon": "mdi:clock-check",
                     "experiments": len(self.config.experiments) if self.config else 0,
                 },
-            )
-
+            ))
         except Exception as e:
             logger.error(f"Failed to publish heartbeat: {e}", exc_info=True)
+            return False
 
     async def main_loop(self):
         """
@@ -9242,52 +9636,7 @@ class MLForecastLabApp:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        # Per-experiment timers: each experiment has its own forecast/retrain
-        # schedule, falling back to global config if not set.
-        self._next_forecast_per_exp = {}
-        self._next_retrain_per_exp = {}
-
-        now = datetime.now(timezone.utc)
-        for exp_cfg in self.config.experiments:
-            fc_mins = exp_cfg.forecast_every_minutes or self.config.forecast_every_minutes
-            rt_hrs = exp_cfg.retrain_every_hours or self.config.retrain_every_hours
-            if exp_cfg.mode == "production":
-                # Production experiments retrain immediately on startup so
-                # cached models exist and forecast sensors get published
-                # right away — unless _restore_cached_models already
-                # populated a fresh cache from disk, in which case defer
-                # to when the schedule would have fired next. Avoids
-                # thrashing through N sequential retrains on every restart.
-                cached = self._cached_models.get(exp_cfg.name)
-                cached_ts = cached.get("trained_at") if cached else None
-                if cached_ts is not None and (now - cached_ts).total_seconds() < rt_hrs * 3600:
-                    age_m = (now - cached_ts).total_seconds() / 60
-                    self._next_retrain_per_exp[exp_cfg.name] = cached_ts + timedelta(seconds=rt_hrs * 3600)
-                    logger.info(
-                        f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
-                        f"retrain in {((self._next_retrain_per_exp[exp_cfg.name] - now).total_seconds() / 3600):.1f}h "
-                        f"(restored cache is {age_m:.0f}m old)"
-                    )
-                else:
-                    self._next_retrain_per_exp[exp_cfg.name] = now
-                    stale_reason = (
-                        f"cache {((now - cached_ts).total_seconds() / 3600):.1f}h old, stale"
-                        if cached_ts is not None
-                        else "no cached model"
-                    )
-                    logger.info(
-                        f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
-                        f"retrain IMMEDIATELY ({stale_reason})"
-                    )
-            else:
-                self._next_retrain_per_exp[exp_cfg.name] = now + timedelta(
-                    seconds=rt_hrs * 3600
-                )
-                logger.info(
-                    f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
-                    f"retrain in {rt_hrs}h"
-                )
-            self._next_forecast_per_exp[exp_cfg.name] = now + timedelta(seconds=fc_mins * 60)
+        self._init_timers(datetime.now(timezone.utc))
 
         while self.running:
             try:
@@ -9300,6 +9649,16 @@ class MLForecastLabApp:
                         await self.load_config()
                     except Exception:
                         pass
+
+                # v2.52.7: re-post the app's sensors if HA lost them.
+                if (self._next_states_check is None
+                        or now >= self._next_states_check):
+                    self._next_states_check = now + timedelta(
+                        seconds=HA_STATES_CHECK_SECONDS
+                    )
+                    if not self._states_check_running:
+                        self._states_check_running = True
+                        self._spawn(self._check_ha_states())
 
                 # Check each experiment's schedule
                 for exp_cfg in self.config.experiments:
@@ -9356,6 +9715,66 @@ class MLForecastLabApp:
                 await asyncio.sleep(5)
 
         logger.info("Main event loop terminated")
+
+    def _init_timers(self, now: datetime) -> None:
+        """Set each experiment's first forecast and retrain times.
+
+        Per-experiment timers: each experiment has its own forecast/retrain
+        schedule, falling back to global config if not set.
+        """
+        self._next_forecast_per_exp = {}
+        self._next_retrain_per_exp = {}
+
+        for exp_cfg in self.config.experiments:
+            fc_mins = exp_cfg.forecast_every_minutes or self.config.forecast_every_minutes
+            rt_hrs = exp_cfg.retrain_every_hours or self.config.retrain_every_hours
+            if exp_cfg.mode == "production":
+                # Production experiments retrain immediately on startup so
+                # cached models exist and forecast sensors get published
+                # right away — unless _restore_cached_models already
+                # populated a fresh cache from disk, in which case defer
+                # to when the schedule would have fired next. Avoids
+                # thrashing through N sequential retrains on every restart.
+                cached = self._cached_models.get(exp_cfg.name)
+                cached_ts = cached.get("trained_at") if cached else None
+                if cached_ts is not None and (now - cached_ts).total_seconds() < rt_hrs * 3600:
+                    age_m = (now - cached_ts).total_seconds() / 60
+                    self._next_retrain_per_exp[exp_cfg.name] = cached_ts + timedelta(seconds=rt_hrs * 3600)
+                    logger.info(
+                        f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
+                        f"retrain in {((self._next_retrain_per_exp[exp_cfg.name] - now).total_seconds() / 3600):.1f}h "
+                        f"(restored cache is {age_m:.0f}m old)"
+                    )
+                else:
+                    self._next_retrain_per_exp[exp_cfg.name] = now
+                    stale_reason = (
+                        f"cache {((now - cached_ts).total_seconds() / 3600):.1f}h old, stale"
+                        if cached_ts is not None
+                        else "no cached model"
+                    )
+                    logger.info(
+                        f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
+                        f"retrain IMMEDIATELY ({stale_reason})"
+                    )
+            else:
+                self._next_retrain_per_exp[exp_cfg.name] = now + timedelta(
+                    seconds=rt_hrs * 3600
+                )
+                logger.info(
+                    f"Timers for {exp_cfg.name}: forecast every {fc_mins}m, "
+                    f"retrain in {rt_hrs}h"
+                )
+            # v2.52.7: a restored model forecasts shortly after start, not
+            # a full cadence later — HA does not restore the app's sensors
+            # across its own restart. Experiments retraining now publish
+            # when the retrain finishes.
+            if exp_cfg.mode == "production" and cached:
+                self._next_forecast_per_exp[exp_cfg.name] = now + min(
+                    timedelta(seconds=STARTUP_FORECAST_DELAY_SECONDS),
+                    timedelta(minutes=fc_mins),
+                )
+            else:
+                self._next_forecast_per_exp[exp_cfg.name] = now + timedelta(seconds=fc_mins * 60)
 
     async def shutdown(self):
         """Gracefully shutdown the application."""
@@ -9418,9 +9837,16 @@ class MLForecastLabApp:
                 "/data/ml_forecast_lab/source_units.json"
             )
             self._restore_source_units()
+            # v2.52.7: and which sensors it posted, so ones it no longer
+            # produces can be removed.
+            self._published_entities_path = Path(
+                "/data/ml_forecast_lab/published_entities.json"
+            )
+            self._restore_published_entities()
 
             # Start web server
             await self.start_web_server()
+            self._sync_restored_models_to_ui()
 
             # Run main event loop
             await self.main_loop()
@@ -9429,6 +9855,26 @@ class MLForecastLabApp:
             logger.info("Received keyboard interrupt")
         finally:
             await self.shutdown()
+
+    async def _publish_benchmark_outcome(
+        self, exp_cfg, started_at: datetime, ran: Optional[bool],
+    ) -> None:
+        """Post ``_last_benchmark`` after a benchmark that raised nothing:
+        ``failed`` when it found no measured target data (*ran* False),
+        else ``completed`` with its duration and this run's winner."""
+        if ran is False:
+            await self._publish_lifecycle_sensor(
+                exp_cfg, "benchmark", "failed",
+                {"error": "no measured target data in the history window"},
+            )
+            return
+        duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+        attrs = {"duration_seconds": round(duration, 1)}
+        br = (self.web_app.state.appstate.benchmark_results.get(exp_cfg.name)
+              if self.web_app else None)
+        if br and getattr(br, "best_model_name", None):
+            attrs["winner"] = br.best_model_name
+        await self._publish_lifecycle_sensor(exp_cfg, "benchmark", "completed", attrs)
 
     async def _publish_lifecycle_sensor(
         self,
@@ -9449,6 +9895,9 @@ class MLForecastLabApp:
         forecast sensors: ``sensor.{publish_prefix}{publish_name}_last_<event>``.
         Best-effort: failures are logged but don't propagate, so a stale HA
         REST token won't break the user-visible benchmark or retrain cycle.
+
+        v2.52.7: the id is recorded so it can be removed once the
+        experiment no longer produces it.
         """
         if not self.ha_interface:
             return
@@ -9467,6 +9916,7 @@ class MLForecastLabApp:
             }
             if attrs:
                 payload_attrs.update(attrs)
+            self._record_published(exp_cfg.name, [entity_id])
             await self.ha_interface.set_state(entity_id, now_iso, payload_attrs)
         except Exception as e:
             # Lifecycle publish is best-effort. A failure here must not
