@@ -9,7 +9,7 @@
 - In 2.52.5, a hiccup while Home Assistant was restarting could still leave
   the forecast sensors without a unit until the next retrain.
 - That brought back the "The unit has changed" repair.
-- The add-on now keeps the last known unit whenever it can't read the sensor.
+- The app now keeps the last known unit whenever it can't read the sensor.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
 
 ## 2.52.5
@@ -19,10 +19,10 @@
 **Forecast sensors keep their unit after a restart.**
 
 - After rebooting, Home Assistant could show a "The unit has changed" repair
-  for the add-on's forecast sensors, and their statistics had a gap.
+  for the app's forecast sensors, and their statistics had a gap.
 - This mostly affected experiments that forecast a sensor from another
-  add-on.
-- The add-on now remembers each sensor's unit across restarts.
+  app.
+- The app now remembers each sensor's unit across restarts.
 - If Home Assistant shows this repair, choose **Close** rather than **Fix
   issue**; it clears itself within a couple of hours.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)

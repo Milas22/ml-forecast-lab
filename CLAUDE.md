@@ -146,19 +146,20 @@ still describe the old behaviour?
 
 The CHANGELOG is **user-facing release notes for HA users, not a design record**. HA's Update
 dialog renders every section between the installed and the latest version, often on a phone,
-to people who use the add-on but don't read its code. Write for that reader. House style:
+to people who use the app but don't read its code. Write for that reader. House style:
 
 - Sections `### Added` / `### Fixed` / `### Changed` only, in that order.
 - Each item is a **bold one-sentence summary of what is better for the user**, then a short
   bullet list, one plain sentence per bullet: what they may have noticed, who is affected (when
   not everyone), what is different now, and anything they should do. 2–5 bullets; aim for under
   ~80 words per item.
-- Use the words people see in HA and the add-on's UI: sensor names, the Repairs page, tab names,
+- Use the words people see in HA and the app's UI: sensor names, the Repairs page, tab names,
   `mlfl.yaml` keys they set. No function names, code paths, HTTP codes, attribute values or
   internal terms ("publish", "resolve", "cache", "target"). Name a cause only when it tells the
-  user whether they're affected, and then in their terms ("a sensor from another add-on").
-- Don't name other projects, add-ons, integrations or vendors; describe them generically.
+  user whether they're affected, and then in their terms ("a sensor from another app").
+- Don't name other projects, apps, integrations or vendors; describe them generically.
   Specifics belong in the linked investigation note.
+- Call it an **app**, never an add-on: Home Assistant renamed add-ons to apps.
 - Give any action the user must take its own bullet ("If HA shows this repair, choose **Close**").
 - Causes, mechanisms, measurements, design choices and review findings go in
   `docs/investigations/*.md`, linked as the item's last bullet, `[Technical details](<absolute
@@ -171,10 +172,10 @@ Example:
 ```markdown
 **Forecast sensors keep their unit after a restart.**
 
-- After rebooting, Home Assistant could show a "The unit has changed" repair for the add-on's
+- After rebooting, Home Assistant could show a "The unit has changed" repair for the app's
   forecast sensors, and their statistics had a gap.
-- This mostly affected experiments that forecast a sensor from another add-on.
-- The add-on now remembers each sensor's unit across restarts.
+- This mostly affected experiments that forecast a sensor from another app.
+- The app now remembers each sensor's unit across restarts.
 - If Home Assistant shows this repair, choose **Close** rather than **Fix issue**; it clears
   itself within a couple of hours.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
@@ -247,5 +248,5 @@ Example:
 ## Documentation audiences
 
 `ml-forecast-lab/README.md` and `DOCS.md` render inside HA's app UI (Info/Documentation tabs) —
-write them for HA users. `docs/` (MODEL_GUIDE, RANKING_NOTES, investigations/) is the
+write them for HA users, and call it an app, not an add-on. `docs/` (MODEL_GUIDE, RANKING_NOTES, investigations/) is the
 maintainer/design layer. Match depth to shelf.
