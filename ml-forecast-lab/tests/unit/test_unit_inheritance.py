@@ -19,15 +19,18 @@ from ml_forecast_lab.config import ExperimentCfg
 
 
 class _StubHA:
-    """Captures set_state payloads; serves a (mutable) source unit.
+    """Captures set_state payloads; serves a (mutable) source unit and state.
 
+    ``_source_state`` is the source sensor's state; None means the entity is
+    absent from HA (a 404 — ``HAInterface.get_state`` returns ``default``).
     ``raise_on_unit`` makes the unit lookup raise to simulate a transient
     HA API failure (``HAInterface.get_state`` would itself swallow this and
     return ``default``, so the stub mirrors the value path: None).
     """
 
-    def __init__(self, source_unit):
+    def __init__(self, source_unit, source_state="1.0"):
         self._source_unit = source_unit
+        self._source_state = source_state
         self.raise_on_unit = False
         self.captured: list = []
         self.get_state_calls = 0
@@ -41,7 +44,11 @@ class _StubHA:
             self.get_state_calls += 1
             if self.raise_on_unit:
                 raise RuntimeError("simulated transient HA failure")
+            if self._source_state is None:
+                return default
             return self._source_unit if self._source_unit is not None else default
+        if attribute is None and self._source_state is not None:
+            return self._source_state
         return default
 
 
@@ -121,10 +128,11 @@ def test_retrain_then_transient_empty_keeps_last_good_unit():
     units = _publish(app, _exp(units=""))
     assert all(u == "W" for u in units)
 
-    # Simulate the retrain cache invalidation (main.py:_retrain_single).
+    # Simulate the retrain cache invalidation (main.py:_retrain_and_cache).
     app._source_unit_cache.pop("sensor.pv_power", None)
-    # Source now returns no unit on the fresh lookup (transient miss).
+    # Source is momentarily unavailable with no unit on the fresh lookup.
     app.ha_interface._source_unit = None
+    app.ha_interface._source_state = "unavailable"
 
     units2 = _publish(app, _exp(units=""))
     assert all(u == "W" for u in units2), (

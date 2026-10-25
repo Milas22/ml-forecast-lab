@@ -1203,18 +1203,23 @@ class MLForecastLabApp:
         # Per-target-entity cache of the source sensor's HA
         # ``unit_of_measurement``, used to auto-inherit the forecast
         # unit when the experiment leaves ``units`` blank. Fetched lazily
-        # on first publish for an entity and reused for the process
-        # lifetime (a source sensor's unit effectively never changes;
-        # a restart re-resolves it). Keyed by target_entity so multiple
-        # experiments on the same sensor share one lookup.
+        # on first publish for an entity and reused until the next
+        # retrain re-resolves it. Keyed by target_entity so multiple
+        # experiments on the same sensor share one lookup. Only a
+        # conclusive lookup is cached (see ``_resolve_units``).
         self._source_unit_cache: Dict[str, str] = {}
         # Last *successfully* resolved non-empty source unit per target
         # entity. Unlike ``_source_unit_cache`` this is NEVER invalidated on
-        # retrain — it's the fallback that stops a transient HA fetch failure
-        # (or the source sensor being momentarily ``unavailable``) during the
-        # post-retrain re-resolve from republishing an empty unit and making
-        # HA flag a unit_of_measurement change.
+        # retrain — it's the fallback that stops an inconclusive lookup (HA
+        # unreachable, the source absent or ``unavailable``) from
+        # republishing an empty unit and making HA raise a "unit has
+        # changed" repair. v2.52.5: mirrored to ``_source_units_path`` so
+        # the fallback survives an add-on restart.
         self._source_unit_last_good: Dict[str, str] = {}
+        # v2.52.5: on-disk copy of ``_source_unit_last_good``, set by run().
+        # None disables persistence, so tests and replay shadow apps never
+        # touch /data.
+        self._source_units_path: Optional[Path] = None
         # Resolved runtime-resource limits actually applied to this process
         # (CPU thread cap, nice value). Surfaced on the System page so the
         # user can verify their settings took effect.
@@ -1928,18 +1933,25 @@ class MLForecastLabApp:
              kWh stays kWh, °C stays °C). This is what makes units "just
              work" for experiments created through the web UI, which has
              no units field.
-          3. The last successfully-resolved unit if a fresh fetch comes back
-             empty or fails — so a transient HA hiccup (or the source sensor
-             being momentarily ``unavailable``) on the post-retrain
-             re-resolve doesn't republish an empty unit and make HA flag a
-             unit_of_measurement change.
-          4. Empty string only if the source genuinely has no unit and we've
-             never resolved one — identical to the prior cold-start
-             behaviour, never raises.
+          3. The last successfully-resolved unit when the lookup is
+             inconclusive: HA unreachable, or the source absent (404) or
+             ``unavailable`` / ``unknown`` without a unit. A REST-published
+             source (e.g. Predbat's ``predbat.pv_power``) is not in HA's
+             entity registry, so an HA restart removes it until its
+             publisher's next cycle. v2.52.5: the fallback is persisted, so
+             it also covers the first publish after an add-on restart.
+          4. Empty string when the source is present and available but has
+             no unit (cached; any remembered unit is forgotten), or when the
+             lookup is inconclusive and no unit was ever resolved (returned
+             for this publish only and retried on the next). Never raises.
 
-        The inherited value is cached per target entity so this costs at
-        most one extra HA call per entity per process, not one per
-        publish cycle.
+        Publishing "" over a unit HA has already recorded statistics for
+        makes HA raise a "unit has changed" repair and stop compiling
+        long-term statistics until the unit returns — hence an inconclusive
+        lookup never replaces a known unit, and is never cached as "".
+
+        A conclusive result is cached per target entity until the next
+        retrain, so steady state costs no HA call per publish cycle.
         """
         if exp_cfg.units:
             return exp_cfg.units
@@ -1950,6 +1962,9 @@ class MLForecastLabApp:
             return cached
 
         unit = None
+        # True only when HA answered with a usable state for the source, so
+        # an empty unit means "genuinely unitless", not "not there yet".
+        conclusive = False
         if self.ha_interface:
             try:
                 fetched = await self.ha_interface.get_state(
@@ -1957,6 +1972,16 @@ class MLForecastLabApp:
                 )
                 if isinstance(fetched, str) and fetched.strip():
                     unit = fetched.strip()
+                else:
+                    # get_state returns the same default for a missing
+                    # attribute, a 404 and an unreachable HA; the state
+                    # tells them apart.
+                    state = await self.ha_interface.get_state(
+                        entity, default=None,
+                    )
+                    conclusive = state not in (
+                        None, "", "unknown", "unavailable",
+                    )
             except Exception as e:
                 logger.debug(
                     f"  Could not auto-resolve unit from {entity}: {e}"
@@ -1970,26 +1995,89 @@ class MLForecastLabApp:
                     f"  Auto-inherited unit '{unit}' from {entity} "
                     f"for {exp_cfg.name} (no units set in config)"
                 )
+                self._source_unit_last_good[entity] = unit
+                self._persist_source_units()
             self._source_unit_cache[entity] = unit
-            self._source_unit_last_good[entity] = unit
             return unit
 
-        # Fetch failed or the source reported no unit. Prefer the last known
-        # good unit over republishing "": a transient miss on the
-        # post-retrain re-resolve must not clobber a good value and make HA
-        # flag a unit_of_measurement change.
+        if conclusive:
+            # Present and available with no unit: the source is genuinely
+            # unitless now. Forget any remembered unit so a restart can't
+            # resurrect it.
+            if self._source_unit_last_good.pop(entity, None):
+                logger.info(
+                    f"  {entity} no longer reports a unit; publishing "
+                    f"{exp_cfg.name} without one"
+                )
+                self._persist_source_units()
+            self._source_unit_cache[entity] = ""
+            return ""
+
+        # Inconclusive lookup: keep the last known good unit rather than
+        # republish "" over it.
         last_good = self._source_unit_last_good.get(entity)
         if last_good:
             logger.debug(
-                f"  Unit fetch for {entity} returned empty; keeping "
+                f"  Unit lookup for {entity} was inconclusive; keeping "
                 f"last-known unit '{last_good}' for {exp_cfg.name}"
             )
             self._source_unit_cache[entity] = last_good
             return last_good
 
-        # Never resolved a unit for this entity — cold-start empty, as before.
-        self._source_unit_cache[entity] = ""
+        # No unit known yet: unitless for this publish only. Not cached, so
+        # the next publish retries rather than pinning "" until the retrain.
+        logger.info(
+            f"  Could not resolve a unit from {entity} (absent or "
+            f"unavailable in HA); publishing {exp_cfg.name} without one "
+            f"and retrying next cycle"
+        )
         return ""
+
+    def _restore_source_units(self) -> None:
+        """v2.52.5: reload the last resolved source units a previous run
+        saved, so the first publish after a restart can fall back to them
+        while a target sensor is still absent from HA.
+
+        A missing or unreadable file leaves the fallback empty.
+        """
+        import json
+        path = self._source_units_path
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except Exception as e:
+            logger.warning(f"  Could not read saved source units from {path}: {e}")
+            return
+        if not isinstance(data, dict):
+            return
+        for entity, unit in data.items():
+            if isinstance(entity, str) and isinstance(unit, str) and unit.strip():
+                self._source_unit_last_good[entity] = unit.strip()
+        if self._source_unit_last_good:
+            logger.info(
+                f"Restored last-known units for "
+                f"{len(self._source_unit_last_good)} source sensor(s)"
+            )
+
+    def _persist_source_units(self) -> None:
+        """Write ``_source_unit_last_good`` to ``_source_units_path``.
+
+        Swallows errors: a failed write only costs the restart fallback,
+        never the publish.
+        """
+        import json
+        path = self._source_units_path
+        if path is None:
+            return
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                self._source_unit_last_good, indent=2, sort_keys=True,
+            ))
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"  Could not save source units to {path}: {e}")
 
     async def _prepare_load_subtract_inputs(
         self,
@@ -5780,9 +5868,9 @@ class MLForecastLabApp:
         logger.info(f"  Retraining {exp_cfg.name}...")
 
         # Re-resolve the auto-inherited unit on each retrain (~daily) so a
-        # value cached as empty during a cold-start miss, or a source
-        # sensor whose unit was changed in HA, gets picked up. The
-        # immediate post-retrain forecast then publishes with it.
+        # source sensor whose unit was changed in HA, or that gained or lost
+        # one, gets picked up. The immediate post-retrain forecast then
+        # publishes with it.
         self._source_unit_cache.pop(exp_cfg.target_entity, None)
 
         # Cooperative cancel flag (audit F10) — checked by the epoch
@@ -9323,6 +9411,13 @@ class MLForecastLabApp:
             # Restore any production models persisted by a previous run
             # before main_loop decides whether to queue immediate retrains.
             self._restore_cached_models()
+
+            # v2.52.5: and the last resolved source units, so the first
+            # publish keeps its unit while a target is still absent from HA.
+            self._source_units_path = Path(
+                "/data/ml_forecast_lab/source_units.json"
+            )
+            self._restore_source_units()
 
             # Start web server
             await self.start_web_server()

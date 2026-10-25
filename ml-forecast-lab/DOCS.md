@@ -57,7 +57,7 @@ The app searches these in order: explicit `--config-path` (development only) →
 | `forecast_every_minutes` | int | inherits global | Per-experiment override of the inference cadence. |
 | `retrain_every_hours` | float | inherits global | Per-experiment override of the retrain cadence. |
 | `country` | ISO code | unset | Two-letter country code for holiday features (`GB`, `US`, `DE`, …). Unset = no holiday feature. |
-| `units` | string | `""` | Target units (`W`, `kWh`, `%`, …). Shown in the UI and on published sensors. If left blank, the unit is auto-inherited from the target sensor's own `unit_of_measurement` in Home Assistant — so for most experiments you don't need to set this at all. |
+| `units` | string | `""` | Target units (`W`, `kWh`, `%`, …). Shown in the UI and on published sensors. If left blank, the unit is auto-inherited from the target sensor's own `unit_of_measurement` in Home Assistant — so for most experiments you don't need to set this at all. The inherited unit is remembered across restarts, so a target Home Assistant hasn't re-created yet after a reboot doesn't strip the unit from the forecast sensors. |
 | `max_age` | int (days) | `365` | Cap on rows kept in the SQLite cache for this experiment's target, covariates and state-mode external forecasts. The cache is always-on (v2.33.1+); older rows are pruned each cycle. Cache tables are keyed by entity, so when several experiments reference the same entity the table is pruned at the **largest** `max_age` among them (v2.50.0+) — a short-`max_age` experiment can no longer delete history a longer-lived one still trains on. Set this at least as large as `days_history`, or the cache is pruned back inside the window you train on. |
 | `publish_prefix` | string | `mlfl_` | Prefix for every companion sensor. Change only if you have a naming clash. |
 | `publish_name` | string | inherits `name` | Override the experiment's name when constructing companion sensor IDs. |
@@ -502,6 +502,12 @@ Check the app log for `[HA]` errors. The most common causes:
 `_upper_<pct>` / `_lower_<pct>` only publish once enough residuals have been calibrated (default 10 deployed predictions whose actuals have arrived). Until then the Forecast Accuracy tab shows a countdown ("Calibrating · 4 of 10 residuals · ~3 h to bands"). After ~3 forecast cycles in production the bands should appear.
 
 If they vanished after a retrain: v2.24.0 had a regression where the conformal query filtered too strictly to the fresh model version. Upgrade to v2.27 or later, which falls back to pooled residuals during cold-start.
+
+### Repairs shows "The unit has changed" for an `mlfl_` sensor
+
+Home Assistant raises this repair when a sensor's unit no longer matches the unit its long-term statistics were recorded in. Before v2.52.5 a restart could publish the forecast sensors without a unit for up to a day. Update the app and choose **Close**: the repair clears itself at Home Assistant's next hourly statistics check once the sensor carries its unit again.
+
+Don't use **Fix issue** for this case. "Update the unit…" rewrites the stored unit to the empty one, so the same repair returns in reverse once the unit is back. "Delete all old statistic data" discards the sensor's statistics. If you changed the target sensor's unit on purpose, the repair is genuine. To pin the unit whatever the target reports, set `units:` on the experiment in `mlfl.yaml`.
 
 ### Solar forecasts go positive at night
 
