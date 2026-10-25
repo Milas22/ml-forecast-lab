@@ -102,7 +102,7 @@ The UI re-reads `mlfl.yaml` on each request, so hand edits and UI changes can be
 4. **Click Publish.** That single button promotes the chosen model AND switches the experiment to production mode — no YAML edit needed. The app retrains every 24 h and publishes:
 
    - `sensor.mlfl_household_load_forecast` — next-interval forecast value.
-   - `sensor.mlfl_household_load_upper_80` / `_lower_80` — conformal prediction bands (calibrated against recent residuals; appear after ~10 forecasts have been compared against actuals).
+   - `sensor.mlfl_household_load_upper_80` / `_lower_80` — conformal prediction bands (calibrated against recent residuals; `unknown` until ~10 forecasts have been compared against actuals).
    - `sensor.mlfl_household_load_cumulative` — integrated forecast curve.
    - `sensor.mlfl_household_load_forecast_accuracy` — running accuracy summary.
    - `sensor.mlfl_household_load_last_benchmark` / `_last_retrain` — ISO timestamps you can trigger automations on.

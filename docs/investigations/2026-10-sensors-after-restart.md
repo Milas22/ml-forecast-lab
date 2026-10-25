@@ -21,7 +21,7 @@ python -m pytest tests/unit/test_restart_availability.py -v
 | **B.** `startup: services` started the app before Core; the Supervisor proxy answers 502 until Core is `RUNNING` | An experiment with no usable saved model retrained at once, failed on the 502, and was not retried for `retrain_every_hours`: no forecasts for up to a day | `startup: application`; an `HAUnavailableError` retrain or forecast failure retries after `HA_RETRY_MINUTES` (2, 5, 15, 60, capped at the cadence) |
 | **C.** A retrain replacing a pinned `production_model` deleted the old cache entry first | A failed replacement left the experiment with nothing to forecast with | The old entry is restored if the retrain fails |
 | **D.** `_cumulative` (signed predictions) and the bands (before calibration) were omitted | HA showed their last value until a restart removed them; a PV model that dips below zero at night rarely has an unsigned 24 h horizon, so `_cumulative` stayed missing | Posted as `unknown` with a `status` attribute (`signed_predictions`, `no_conformal_bands`); bands under the configured `conformal_coverage` level's ids |
-| **E.** `_last_retrain` and `sensor.mlfl_last_run` were only posted by a retrain; `_last_benchmark` only by the lab-mode cycle, never by a Training-tab benchmark | Missing for up to `retrain_every_hours` after any HA restart; `_last_benchmark` of a production experiment never came back | The heartbeat is posted with every successful forecast; the Training-tab benchmark posts `_last_benchmark`; `_restore_lifecycle_sensors` re-posts both lifecycle sensors when HA lacks them |
+| **E.** `sensor.mlfl_last_run` was only posted by a retrain; `_last_benchmark` only by the lab-mode cycle, never by a Training-tab benchmark | The heartbeat missing for up to `retrain_every_hours` after any HA restart; `_last_benchmark` of a production experiment never came back | The restart check posts the heartbeat, stamped with the last successful forecast or retrain; the Training-tab benchmark posts `_last_benchmark`. The `_last_<event>` sensors are deliberately not re-created (see below) |
 | **F.** Nothing retired an entity id the app stopped producing (experiment renamed, switched to lab or removed; `publish_name`/`publish_prefix` or `conformal_coverage` changed) | The old sensors kept their last values until an HA restart dropped them | `_retire_orphaned_sensors` deletes recorded ids no current production experiment produces |
 | **G.** `_restore_cached_models` mirrored restored models into the dashboard status before the web app existed, so the mirror never ran | A production experiment with a restored model but no saved benchmark result showed "Pending" and no model | `_sync_restored_models_to_ui` runs after `start_web_server` and fills only what the saved benchmark left unset |
 
@@ -74,11 +74,21 @@ settles back onto the schedule.
 **HA-restart detection.** Every `HA_STATES_CHECK_SECONDS` (60) the main loop
 calls `entity_exists(HEARTBEAT_ENTITY)`: one attempt, with no warning when HA
 is down.
-- The heartbeat is posted with every successful forecast, so once it has been
-  seen, a 404 means HA dropped the app's states.
-- The last payloads of current production experiments, and the stored
-  `_last_<event>` payloads, are then re-posted once. An experiment whose
-  forecast is running is skipped, so fresh values are not overwritten.
+- Only this check posts the heartbeat. Successful forecasts and retrains call
+  `_note_success()`, and the check posts that time when it changes.
+- An earlier draft posted the heartbeat from every successful forecast. A
+  review showed that any experiment's tick, or its 2-minute retry, landing
+  between HA's return and the next check re-created the sentinel. The check
+  then saw it present and never re-posted the other experiments' sensors.
+- Once the heartbeat has been seen, a 404 means HA dropped the app's states.
+  The last payloads of current production experiments are re-posted once,
+  limited to the ids each still produces (`_expected_entities`). An
+  experiment whose forecast is running is skipped, so fresh values are not
+  overwritten.
+- The heartbeat is then re-posted with the last success time, not "now". A
+  re-post is not a forecast, and a watchdog on the heartbeat must not read
+  it as one. `_ha_states_seen` is set again as soon as that post succeeds,
+  so a second HA restart before the next check is still caught.
 
 Design choices:
 - **Re-post the last payload rather than run a forecast.** It is instant, needs
@@ -96,13 +106,17 @@ Design choices:
   still be loading. Without the delay the first forecast would run on
   NaN-filled covariates and be logged as a real issuance.
 
-**`_last_retrain` restore.** After an experiment's first successful forecast
-since start, or since a loss, `_restore_lifecycle_sensor` checks whether HA
-has the sensor.
-- It re-posts this process's last payload unchanged, or else the cached
-  model's `trained_at`.
-- Never "now", and never over a sensor HA still has: a changed timestamp would
-  fire automations for a retrain that did not happen.
+**`_last_retrain` / `_last_benchmark` are not re-created.** An earlier draft
+re-posted them after a restart, from this process's last payload or the
+cached `trained_at` / saved benchmark timestamp. A review showed why that is
+wrong.
+- The entity no longer exists in HA, so the POST creates it: `state_changed`
+  with `old_state=None`.
+- HA's state trigger matches that whenever no `from` is set, and also on `to:`
+  or an `attribute:` filter. A "retrain finished" automation would therefore
+  fire after every HA restart and reboot, whatever the timestamp.
+- A sensor missing until the next real retrain or benchmark is the lesser
+  harm. Users with automations on them need no change.
 
 **Retiring orphaned sensors.** `_record_published` maps every id the app
 posts (forecast family and lifecycle) to its experiment and mirrors it to
@@ -133,9 +147,8 @@ non-cumulative sources: it would only duplicate `_forecast`.
 
 ## Limits that remain
 
-- A rebuilt `_last_benchmark` is only possible from the saved benchmark
-  result. One discarded at start (none of its models still enabled) leaves the
-  sensor missing until the next benchmark.
+- By design, `_last_retrain` and `_last_benchmark` stay missing after an HA
+  restart until the next retrain or benchmark (see above).
 - **Not availability, found in the same review.** A covariate column absent at
   forecast time reaches the tree path as 0.0 with its pinned `_missing`
   indicator zero-filled (`preprocessing.py` `resolve_missingness`,

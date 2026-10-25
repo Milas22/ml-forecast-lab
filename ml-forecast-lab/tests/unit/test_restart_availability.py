@@ -13,7 +13,15 @@ Defects pinned (all live up to v2.52.6):
   first, so a failed retrain left nothing to forecast with.
 - ``_cumulative`` (signed predictions) and the bands (before calibration)
   were omitted rather than posted, so an HA restart removed them.
-- ``_last_retrain`` and the heartbeat were only posted by a retrain.
+- The heartbeat (``sensor.mlfl_last_run``) was only posted by a retrain,
+  and ``_last_benchmark`` never by a Training-tab benchmark.
+- Sensors of renamed, removed or lab experiments were never removed, and a
+  restored model without a saved benchmark showed "Pending".
+
+Review-driven constraints, also pinned: only the restart check posts the
+heartbeat (any other path could re-create it after an HA restart and hide
+the loss), and ``_last_<event>`` sensors are never re-created (that fires
+state-triggered automations for an event that didn't happen).
 """
 from __future__ import annotations
 
@@ -235,11 +243,7 @@ class TestRetrainRetry:
         async def boom(_cfg):
             raise exc
 
-        async def noop(*a, **k):
-            return None
-
         app._retrain_and_cache = boom
-        app.publish_heartbeat = noop
         return app, exp, far
 
     def test_ha_unavailable_retries_with_backoff(self):
@@ -307,30 +311,21 @@ class TestForecastRetry:
         app._cached_models[exp.name] = {"model_name": "lightgbm"}
         far = datetime.now(timezone.utc) + timedelta(minutes=30)
         app._next_forecast_per_exp[exp.name] = far
-        calls = {"heartbeat": 0, "lifecycle": 0}
 
         async def forecast(_name, now=None):
             if isinstance(outcome, BaseException):
                 raise outcome
             return outcome
 
-        async def heartbeat():
-            calls["heartbeat"] += 1
-
-        async def lifecycle(_cfg):
-            calls["lifecycle"] += 1
-
         app._forecast_with_cached = forecast
-        app.publish_heartbeat = heartbeat
-        app._restore_lifecycle_sensors = lifecycle
-        return app, exp, far, calls
+        return app, exp, far, None
 
     @pytest.mark.parametrize("outcome", ["no_frame", "publish_failed", HAUnavailableError("down")])
     def test_failed_tick_retries_within_minutes(self, outcome):
         app, exp, _, calls = self._app(outcome)
         asyncio.run(app._forecast_single(exp))
         assert _minutes_from_now(app._next_forecast_per_exp[exp.name]) == pytest.approx(2, abs=0.1)
-        assert calls["heartbeat"] == 0
+        assert app._last_success_at is None
         assert app._forecast_running[exp.name] is False
 
     @pytest.mark.parametrize("outcome", ["channel_mismatch", "insufficient_data", ValueError("bug")])
@@ -346,11 +341,12 @@ class TestForecastRetry:
             asyncio.run(app._forecast_single(exp))
         assert _minutes_from_now(app._next_forecast_per_exp[exp.name]) == pytest.approx(3, abs=0.1)
 
-    def test_success_posts_heartbeat_and_checks_last_retrain(self):
-        app, exp, _, calls = self._app("ok")
+    def test_success_notes_the_time_but_posts_no_heartbeat(self):
+        app, exp, _, _ = self._app("ok")
         app._forecast_failures[exp.name] = 2
         asyncio.run(app._forecast_single(exp))
-        assert calls == {"heartbeat": 1, "lifecycle": 1}
+        assert app._last_success_at is not None
+        assert HEARTBEAT_ENTITY not in app.ha_interface.posted()
         assert exp.name not in app._forecast_failures
 
 
@@ -430,141 +426,99 @@ class TestRepostAfterHARestart:
         solar, lab = _exp(), _exp("lab", mode="lab")
         app = _make_app(solar, lab)
         _publish(app, solar)
+        asyncio.run(app._publish_lifecycle_sensor(solar, "retrain", "completed"))
         app._last_payloads["lab"] = [("sensor.mlfl_lab_forecast", "1", {})]
         app._last_payloads["gone"] = [("sensor.mlfl_gone_forecast", "1", {})]
-        app._lifecycle_payloads["sensor.mlfl_solar_last_retrain"] = (
-            "2026-10-25T03:00:00+00:00", {"outcome": "completed"}, "solar",
-        )
-        app._lifecycle_checked = {"solar"}
+        app._note_success()
         app.ha_interface.captured = []
         return app
 
+    def _check(self, app, exists):
+        app.ha_interface.exists[HEARTBEAT_ENTITY] = exists
+        asyncio.run(app._check_ha_states())
+
+    def test_heartbeat_posted_by_the_check_with_the_last_success_time(self):
+        app = self._app()
+        self._check(app, False)  # first check after start
+        state, _ = app.ha_interface.posted()[HEARTBEAT_ENTITY]
+        assert state == app._last_success_at.isoformat()
+        assert app._ha_states_seen is True
+        app.ha_interface.captured = []
+        self._check(app, True)   # nothing new to report
+        assert app.ha_interface.captured == []
+
     def test_lost_states_are_reposted_once(self, caplog):
         app = self._app()
-        app.ha_interface.exists[HEARTBEAT_ENTITY] = [True, False, False]
-        asyncio.run(app._check_ha_states())
-        assert app._ha_states_seen is True and app.ha_interface.captured == []
-
+        self._check(app, True)
+        app.ha_interface.captured = []
         with caplog.at_level(logging.INFO, logger="ml_forecast_lab.main"):
-            asyncio.run(app._check_ha_states())
+            self._check(app, False)
         posted = app.ha_interface.posted()
         assert "sensor.mlfl_solar_forecast" in posted
-        assert posted["sensor.mlfl_solar_last_retrain"][0] == "2026-10-25T03:00:00+00:00"
         assert HEARTBEAT_ENTITY in posted
-        # Only current production experiments.
+        # Only current production experiments, and never a lifecycle sensor.
         assert "sensor.mlfl_lab_forecast" not in posted
         assert "sensor.mlfl_gone_forecast" not in posted
-        assert app._lifecycle_checked == set()
+        assert "sensor.mlfl_solar_last_retrain" not in posted
         assert "no longer had the app's sensors" in caplog.text
-
         app.ha_interface.captured = []
-        asyncio.run(app._check_ha_states())
+        self._check(app, True)
         assert app.ha_interface.captured == []
+
+    def test_other_experiments_success_cannot_hide_the_restart(self):
+        # Another experiment forecasting between HA's return and the check
+        # only notes the time; the heartbeat stays missing until the check.
+        app = self._app()
+        self._check(app, True)
+        app._note_success()
+        app.ha_interface.captured = []
+        self._check(app, False)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.posted()
+
+    def test_second_restart_right_after_a_repost_is_caught(self):
+        app = self._app()
+        self._check(app, True)
+        self._check(app, False)
+        app.ha_interface.captured = []
+        self._check(app, False)  # HA restarted again before any check saw it
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.posted()
+
+    def test_repost_does_not_advance_the_heartbeat(self):
+        app = self._app()
+        self._check(app, True)
+        before = app._last_success_at
+        app.ha_interface.captured = []
+        self._check(app, False)
+        assert app.ha_interface.posted()[HEARTBEAT_ENTITY][0] == before.isoformat()
 
     def test_no_repost_before_the_heartbeat_was_seen(self):
         app = self._app()
-        app.ha_interface.exists[HEARTBEAT_ENTITY] = False
-        asyncio.run(app._check_ha_states())
+        self._check(app, False)
+        assert "sensor.mlfl_solar_forecast" not in app.ha_interface.posted()
+
+    def test_no_heartbeat_before_any_success(self):
+        app = self._app()
+        app._last_success_at = None
+        self._check(app, False)
         assert app.ha_interface.captured == []
 
     def test_unreachable_ha_changes_nothing(self):
         app = self._app()
         app._ha_states_seen = True
-        app.ha_interface.exists[HEARTBEAT_ENTITY] = None
-        asyncio.run(app._check_ha_states())
+        self._check(app, None)
         assert app._ha_states_seen is True and app.ha_interface.captured == []
 
     def test_running_forecast_is_not_overwritten(self):
         app = self._app()
         app._ha_states_seen = True
         app._forecast_running["solar"] = True
-        app.ha_interface.exists[HEARTBEAT_ENTITY] = False
-        asyncio.run(app._check_ha_states())
+        self._check(app, False)
         assert "sensor.mlfl_solar_forecast" not in app.ha_interface.posted()
 
-
-# --- _last_retrain / _last_benchmark restore ------------------------------
-
-class TestLastRetrainRestore:
-    LAST = "sensor.mlfl_solar_last_retrain"
-
-    def _app(self, exists):
-        exp = _exp()
-        app = _make_app(exp)
-        app.ha_interface.exists[self.LAST] = exists
-        trained = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
-        app._cached_models["solar"] = {
-            "trained_at": trained, "model_name": "lightgbm", "model_version": "v7",
-        }
-        return app, exp, trained
-
-    def test_missing_sensor_restored_from_the_cached_model(self):
-        app, exp, trained = self._app(False)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        state, attrs = app.ha_interface.posted()[self.LAST]
-        assert state == trained.isoformat()
-        assert attrs["model"] == "lightgbm" and attrs["model_version"] == "v7"
-        assert attrs["outcome"] == "completed"
-        app.ha_interface.captured = []
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert app.ha_interface.captured == []
-
-    def test_present_sensor_left_alone(self):
-        app, exp, _ = self._app(True)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert app.ha_interface.captured == []
-        assert "solar" in app._lifecycle_checked
-
-    def test_unreachable_ha_checks_again_next_time(self):
-        app, exp, _ = self._app(None)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert app.ha_interface.captured == []
-        assert "solar" not in app._lifecycle_checked
-
-    def test_this_processs_payload_reposted_unchanged(self):
-        app, exp, _ = self._app(False)
-        app._lifecycle_payloads[self.LAST] = ("2026-10-25T03:00:07+00:00", {"x": 1}, "solar")
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert app.ha_interface.posted()[self.LAST] == ("2026-10-25T03:00:07+00:00", {"x": 1})
-
-
-class TestLastBenchmarkRestore:
-    LAST = "sensor.mlfl_solar_last_benchmark"
-
-    def _app(self, br):
-        exp = _exp()
-        app = _make_app(exp)
-        app.ha_interface.exists[self.LAST] = False
-        app.web_app = types.SimpleNamespace(state=types.SimpleNamespace(
-            appstate=types.SimpleNamespace(
-                benchmark_results={"solar": br} if br else {},
-                experiment_statuses={},
-            )))
-        return app, exp
-
-    def test_rebuilt_from_the_saved_benchmark_result(self):
-        br = types.SimpleNamespace(
-            timestamp="2026-10-20T09:15:00+00:00", status="completed",
-            best_model_name="nhits",
-        )
-        app, exp = self._app(br)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        state, attrs = app.ha_interface.posted()[self.LAST]
-        assert state == "2026-10-20T09:15:00+00:00"
-        assert attrs["outcome"] == "completed" and attrs["winner"] == "nhits"
-
-    def test_no_saved_result_posts_nothing(self):
-        app, exp = self._app(None)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert self.LAST not in app.ha_interface.posted()
-        assert "solar" in app._lifecycle_checked
-
-    def test_running_benchmark_is_not_restored(self):
-        br = types.SimpleNamespace(timestamp="2026-10-20T09:15:00+00:00",
-                                   status="running", best_model_name=None)
-        app, exp = self._app(br)
-        asyncio.run(app._restore_lifecycle_sensors(exp))
-        assert self.LAST not in app.ha_interface.posted()
+    def test_only_the_check_posts_the_heartbeat(self):
+        src = inspect.getsource(MLForecastLabApp)
+        assert src.count("self._post_heartbeat(") == 1
+        assert "publish_heartbeat" not in src
 
 
 class TestTrainingTabBenchmarkSensor:
@@ -738,6 +692,7 @@ class TestOrphanedSensors:
         app, _ = self._app()
         app.config.experiments = [_exp(conformal_coverage=0.9)]
         app._ha_states_seen = True
+        app._note_success()
         app.ha_interface.exists[HEARTBEAT_ENTITY] = False
         app.ha_interface.delete_result = None
         app.ha_interface.captured = []

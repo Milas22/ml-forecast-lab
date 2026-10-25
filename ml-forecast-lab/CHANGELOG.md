@@ -13,7 +13,9 @@
   two minutes.
 - If Home Assistant restarts, the app puts its sensors back within about a
   minute, and retries within minutes when Home Assistant isn't ready.
-- The last-retrain, last-benchmark and last-run sensors now come back too.
+- The last-run sensor comes back too; the last-retrain and last-benchmark
+  sensors return at the next retrain or benchmark, so automations on them
+  don't fire for one that didn't happen.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
 
 **The cumulative and band sensors no longer disappear.**
@@ -23,7 +25,9 @@
   so a restart removed them.
 - They now show "unknown", with a `status` attribute saying why.
 - For forecasts that can't go below zero, such as solar power, set
-  `target_is_nonnegative: true` so the cumulative sensor gets a value.
+  `target_is_nonnegative: true` so the cumulative sensor gets a value; it
+  takes effect at the next retrain and also treats missing night-time
+  readings as zero, so solar forecasts can shift slightly.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
 
 **Sensors from renamed or lab experiments are removed.**
