@@ -144,16 +144,34 @@ still describe the old behaviour?
 
 ## CHANGELOG conventions (read before writing an entry)
 
-The CHANGELOG is **user-facing release notes for HA users, not a design record**. House style:
+The CHANGELOG is **user-facing release notes for HA users, not a design record**. HA's Update
+dialog renders every section between the installed and the latest version, often on a phone,
+to people who use the add-on but don't read its code. Write for that reader. House style:
 
 - Sections `### Added` / `### Fixed` / `### Changed` only, in that order.
-- Each item opens with a **bold declarative sentence stating the user-visible outcome**, then a
-  few short lines: the symptom the user saw → what changed → what they'll notice after updating.
-  5–20 lines per item; a whole release should stay well under ~80 lines.
-- Deep rationale, post-mortems, measurement methodology, and review findings go in
-  `docs/investigations/*.md`, linked from the CHANGELOG item, never inlined into it.
-- Non-marketing, past-tense-diagnostic tone; name the exact wrong behaviour before the fix.
+- Each item is a **bold sentence stating what is better for the user**, then at most three short,
+  plain sentences: what they may have noticed, what is different now, and anything they should
+  do. Aim for under ~80 words per item.
+- Use the words people see in HA and the add-on's UI: sensor names, the Repairs page, tab names,
+  `mlfl.yaml` keys they set. No function names, code paths, HTTP codes, attribute values or
+  internal terms ("publish", "resolve", "cache", "target"). Name a cause only when it tells the
+  user whether they're affected, and then in their terms ("if you use Predbat").
+- Put any action the user must take in its own sentence ("If HA shows this repair, choose **Close**").
+- Causes, mechanisms, measurements, design choices and review findings go in
+  `docs/investigations/*.md`, linked at the end of the item as `[Technical details](<absolute
+  GitHub URL>)`, never inlined.
+- Factual, past tense for what was wrong, no marketing.
 - The duplicate `## 2.49.2` heading is a known pre-existing quirk — leave it.
+
+Example:
+
+```markdown
+**Forecast sensors keep their unit after a restart.** After rebooting, Home Assistant could
+show a "The unit has changed" repair for the add-on's forecast sensors, and their statistics
+had a gap. The add-on now remembers each sensor's unit across restarts. If Home Assistant
+shows this repair, choose **Close** rather than **Fix issue**; it clears itself within a couple
+of hours. [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
+```
 
 ## Architecture
 
