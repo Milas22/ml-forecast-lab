@@ -1,13 +1,14 @@
-# "The unit has changed" repairs after a restart (v2.52.5)
+# "The unit has changed" repairs after a restart (v2.52.5, v2.52.6)
 
-**Status:** Shipped in v2.52.5. The mechanism, the Home Assistant behaviour
-it trips, the fix and the limits that remain, behind that release's
-CHANGELOG entry.
+**Status:** Shipped in v2.52.5, with the single-read correction in v2.52.6.
+The mechanism, the Home Assistant behaviour it trips, the fix and the
+limits that remain, behind those releases' CHANGELOG entries.
 
 The pinning tests:
 - `ml-forecast-lab/tests/unit/test_unit_restart_fallback.py`: inconclusive
-  lookups are never cached as `""`; the last resolved unit survives a
-  restart; restore-file robustness; the `run()` wiring;
+  lookups are never cached as `""`; a failed read keeps the known unit; the
+  last resolved unit survives a restart; restore-file robustness; the
+  `run()` wiring;
 - `tests/unit/test_unit_inheritance.py`: the v2.43.1 / v2.44.0 behaviour
   (explicit units win, inheritance, caching, retrain re-resolve).
 
@@ -24,6 +25,7 @@ python -m pytest tests/unit/test_unit_restart_fallback.py tests/unit/test_unit_i
 | --- | --- | --- |
 | `_source_unit_last_good` lived only in memory | The v2.44.0 fallback never protected the first resolve after an add-on restart | Mirrored to `/data/ml_forecast_lab/source_units.json`, restored in `run()` before `main_loop` |
 | `_resolve_units` cached `""` whenever the lookup came back empty, including a 404 or an unreachable HA | One miss pinned `""` on every forecast-family sensor until the next retrain, up to `retrain_every_hours` (24 h) | Only a *conclusive* lookup is cached. An inconclusive one with nothing known returns `""` for that publish only, and the next publish retries |
+| v2.52.5 read the unit and the state with two `get_state` calls (live v2.52.5 only) | A failed unit read followed by a good state read was classed as "unitless": `""` cached and the saved unit erased | v2.52.6: one `HAInterface.get_state_object` read supplies both |
 
 Symptom: Home Assistant Repairs shows "The unit of 'X Forecast'
 (sensor.mlfl_X_forecast) changed to '' which can't be converted to the
@@ -115,14 +117,24 @@ and what to cache:
 | --- | --- | --- | --- |
 | Unit present (including on an `unavailable` registry placeholder) | the unit | yes | set (persisted when changed) |
 | Present, state not `unknown`/`unavailable`, no unit | `""` | `""` | **dropped** (persisted) |
-| Inconclusive (404, HA unreachable, `get_state` raising, `unknown`/`unavailable` with no unit), `last_good` known | `last_good` | `last_good` | unchanged |
+| Inconclusive (404, HA unreachable, the read raising, `unknown`/`unavailable` with no unit), `last_good` known | `last_good` | `last_good` | unchanged |
 | Inconclusive, nothing known | `""` | **no**, retried next publish | unchanged |
 
-When the unit lookup returns nothing, a second `get_state(entity)` reads the
-state, because only the state separates "genuinely unitless" from "not there
-yet". It costs one extra call per miss and none in steady state. Replay is
-unaffected: the publish path is outside both replay stages, and the call's
-replay key (`attribute=None`, `default=None`) is deterministic anyway.
+The unit and the state come from **one** response,
+`HAInterface.get_state_object`, which returns the full state dict or `None`.
+Only the state separates "genuinely unitless" from "not there yet", and only
+the same response can say so.
+
+v2.52.5 used two `get_state` calls instead. `get_state` returns the same
+`default` for a missing attribute and for a request that failed (a 404, or a
+5xx or timeout after `api_call`'s retries). So a failed unit read followed,
+a moment later, by a good state read was classed as present-and-unitless:
+`""` was cached until the retrain and the saved unit erased. That is the
+failure this fix exists to prevent. It is reachable when Core recovers from
+a restart, or a REST publisher re-posts the target, between the two reads.
+
+Replay is unaffected: the publish path is outside both replay stages, so
+`get_state_object` needs no recorder.
 
 Design choices:
 - **A conclusive unitless read beats the remembered unit.** The pre-fix code
@@ -157,11 +169,12 @@ retrying next cycle` on each publish until it resolves.
 
 ## Limits that remain
 
-- **First-ever publish with no saved unit:** a fresh install, or the first
-  restart after updating to v2.52.5 before any resolve has been saved. If the
-  target is missing at that publish, the sensors carry `""` for one cycle.
-  The repair only fires if an hourly check lands inside that cycle, and it
-  clears at the next check.
+- **No saved unit yet:** a fresh install, or the first restart after
+  updating before any resolve has been saved. While the target stays missing
+  or unavailable without a unit, every publish carries `""` and retries; the
+  first publish after the target appears carries its unit. The repair fires
+  only if an hourly check lands inside that window, and clears at the first
+  check after the unit returns.
 - **A unit change that coincides with an inconclusive lookup** is adopted at
   the next retrain, as before, because the saved unit is cached until then.
   If the first lookup after a restart is conclusive, the new unit is adopted

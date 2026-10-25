@@ -505,7 +505,7 @@ If they vanished after a retrain: v2.24.0 had a regression where the conformal q
 
 ### Repairs shows "The unit has changed" for an `mlfl_` sensor
 
-Home Assistant raises this repair when a sensor's unit no longer matches the unit its long-term statistics were recorded in. Before v2.52.5 a restart could publish the forecast sensors without a unit for up to a day. Update the app and choose **Close**: the repair clears itself at Home Assistant's next hourly statistics check once the sensor carries its unit again.
+Home Assistant raises this repair when a sensor's unit no longer matches the unit its long-term statistics were recorded in. Before v2.52.6 a restart could publish the forecast sensors without a unit for up to a day. Update the app and choose **Close**: the repair clears itself at Home Assistant's next hourly statistics check once the sensor carries its unit again.
 
 Don't use **Fix issue** for this case. "Update the unit…" rewrites the stored unit to the empty one, so the same repair returns in reverse once the unit is back. "Delete all old statistic data" discards the sensor's statistics. If you changed the target sensor's unit on purpose, the repair is genuine. To pin the unit whatever the target reports, set `units:` on the experiment in `mlfl.yaml`.
 

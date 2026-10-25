@@ -424,6 +424,22 @@ class HAInterface:
             logger.warning(f"Entity not found: {entity_id}")
             return default
 
+    async def get_state_object(self, entity_id: str) -> Optional[dict]:
+        """Return an entity's full state object, or None if it can't be read.
+
+        v2.52.6: one request, so a caller can read ``state`` and
+        ``attributes`` from the same response. Two ``get_state`` calls
+        cannot tell a missing attribute from a failed request, and HA can
+        change between them. None covers a 404 and any request that fails
+        after ``api_call``'s retries.
+        """
+        try:
+            state_obj = await self.api_call("GET", f"/api/states/{entity_id}")
+        except RuntimeError as e:
+            logger.debug(f"Could not read state of {entity_id}: {e}")
+            return None
+        return state_obj if isinstance(state_obj, dict) else None
+
     async def get_last_updated(
         self,
         entity_id: str,

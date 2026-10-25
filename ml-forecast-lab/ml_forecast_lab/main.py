@@ -1967,21 +1967,19 @@ class MLForecastLabApp:
         conclusive = False
         if self.ha_interface:
             try:
-                fetched = await self.ha_interface.get_state(
-                    entity, attribute="unit_of_measurement", default=None,
-                )
-                if isinstance(fetched, str) and fetched.strip():
-                    unit = fetched.strip()
-                else:
-                    # get_state returns the same default for a missing
-                    # attribute, a 404 and an unreachable HA; the state
-                    # tells them apart.
-                    state = await self.ha_interface.get_state(
-                        entity, default=None,
-                    )
-                    conclusive = state not in (
-                        None, "", "unknown", "unavailable",
-                    )
+                # v2.52.6: unit and state from ONE response. Two get_state
+                # calls classified a failed unit read followed by a good
+                # state read as "unitless", erasing a known unit.
+                state_obj = await self.ha_interface.get_state_object(entity)
+                if isinstance(state_obj, dict):
+                    attrs = state_obj.get("attributes") or {}
+                    fetched = attrs.get("unit_of_measurement")
+                    if isinstance(fetched, str) and fetched.strip():
+                        unit = fetched.strip()
+                    else:
+                        conclusive = state_obj.get("state") not in (
+                            None, "", "unknown", "unavailable",
+                        )
             except Exception as e:
                 logger.debug(
                     f"  Could not auto-resolve unit from {entity}: {e}"

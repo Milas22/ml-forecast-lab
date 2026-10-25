@@ -22,10 +22,9 @@ class _StubHA:
     """Captures set_state payloads; serves a (mutable) source unit and state.
 
     ``_source_state`` is the source sensor's state; None means the entity is
-    absent from HA (a 404 — ``HAInterface.get_state`` returns ``default``).
-    ``raise_on_unit`` makes the unit lookup raise to simulate a transient
-    HA API failure (``HAInterface.get_state`` would itself swallow this and
-    return ``default``, so the stub mirrors the value path: None).
+    absent from HA (a 404 — ``HAInterface.get_state_object`` returns None).
+    ``raise_on_unit`` makes the unit lookup raise to simulate an unexpected
+    HA API failure.
     """
 
     def __init__(self, source_unit, source_state="1.0"):
@@ -39,14 +38,18 @@ class _StubHA:
         self.captured.append((entity_id, state, attributes or {}))
         return True
 
+    async def get_state_object(self, entity_id):
+        self.get_state_calls += 1
+        if self.raise_on_unit:
+            raise RuntimeError("simulated transient HA failure")
+        if self._source_state is None:
+            return None
+        attrs = {}
+        if self._source_unit is not None:
+            attrs["unit_of_measurement"] = self._source_unit
+        return {"state": self._source_state, "attributes": attrs}
+
     async def get_state(self, entity_id, default=None, attribute=None):
-        if attribute == "unit_of_measurement":
-            self.get_state_calls += 1
-            if self.raise_on_unit:
-                raise RuntimeError("simulated transient HA failure")
-            if self._source_state is None:
-                return default
-            return self._source_unit if self._source_unit is not None else default
         if attribute is None and self._source_state is not None:
             return self._source_state
         return default
