@@ -412,7 +412,7 @@ class CovariateResolver:
         except Exception as e:
             if len(cached) == 0:
                 raise
-            # v2.53.0: an HA error used to discard the cached rows along with
+            # v2.54.0: an HA error used to discard the cached rows along with
             # the delta (fetch_history returns an empty series on any
             # exception), so the covariate vanished from the frame and the
             # model was fed 0.0 for it. Serve the cache instead: the stretch

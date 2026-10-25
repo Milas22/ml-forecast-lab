@@ -801,6 +801,8 @@ def power_to_energy(
 def apply_transform(
     series: pd.Series,
     transform: Optional[str],
+    shift: Optional[float] = None,
+    lower: Optional[float] = None,
 ) -> pd.Series:
     """
     Apply optional transformation to series.
@@ -820,11 +822,28 @@ def apply_transform(
     Notes
     -----
     Stores transformation metadata in series.attrs for later inversion.
+
+    v2.54.0: ``shift`` / ``lower`` pin the log shift and the series minimum
+    recorded when a model was trained (``series.attrs['transform_min']``), so
+    a later window and a forecast horizon go through the same map instead of
+    one re-derived from their own minimum. Pinned, ``x + shift`` is floored
+    at ``min(1, lower + shift)``: the log stays finite below the trained
+    range, and no value a window-derived shift of 1 or more would accept is
+    moved.
     """
     if transform is None:
         return series.copy()
 
     series = series.copy()
+
+    if transform in ('log', 'shifted_log', 'box_cox') and shift is not None:
+        floor = 1.0 if lower is None else min(1.0, float(lower) + float(shift))
+        out = np.log(np.maximum(series + float(shift), floor))
+        out.attrs['transform'] = 'log' if transform == 'log' else 'shifted_log'
+        out.attrs['transform_shift'] = float(shift)
+        if lower is not None:
+            out.attrs['transform_min'] = float(lower)
+        return out
 
     if transform == 'log':
         # Shift before log if necessary. log(0) = -inf, so any data with
@@ -840,6 +859,7 @@ def apply_transform(
         series = np.log(series + shift)
         series.attrs['transform'] = 'log'
         series.attrs['transform_shift'] = shift
+        series.attrs['transform_min'] = float(min_val)
 
     elif transform == 'sqrt':
         # Clip negative values
@@ -855,6 +875,7 @@ def apply_transform(
         series = np.log(series + shift)
         series.attrs['transform'] = 'shifted_log'
         series.attrs['transform_shift'] = shift
+        series.attrs['transform_min'] = float(min_val)
 
     else:
         raise ValueError(

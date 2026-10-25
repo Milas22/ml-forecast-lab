@@ -588,7 +588,7 @@ def _computed_source_columns(exp_cfg) -> frozenset:
     """Solar columns ``exp_cfg`` gets from pvlib rather than from a sensor:
     never filled or reinstated, and recomputed for every future step.
 
-    v2.53.0: decided from the config, not the name — a covariate on
+    v2.54.0: decided from the config, not the name — a covariate on
     ``sensor.sun_elevation`` is fetched like any other, so it is filled
     when HA returns nothing for it and held like any lagged covariate
     across the horizon. It counts as the user's only while
@@ -622,7 +622,7 @@ def _pinned_indicator_map(pinned, feature_cols) -> dict:
     mirroring how resolve_missingness named them (``_missing``, or
     ``_missing_flag`` when ``<col>_missing`` is itself a column).
 
-    v2.53.0: replaces ``_inference_indicator_map`` (polarity documented
+    v2.54.0: replaces ``_inference_indicator_map`` (polarity documented
     there) at inference — the pinned set, not the name suffix, is the
     record of which flags the model was fitted with.
     """
@@ -637,6 +637,79 @@ def _pinned_indicator_map(pinned, feature_cols) -> dict:
         if name in pinned:
             out[name] = c
     return out
+
+
+def _covariate_transform_record(series, transform) -> dict:
+    """The transform one covariate's history went through, as stored with
+    the model (``covariate_transforms``).
+
+    v2.54.0: ``{"transform": None}`` records an untransformed covariate, so a
+    stored map is authoritative for every covariate it lists: a transform
+    added to the YAML after training is not applied to a model fitted on raw
+    values. A log record without a finite shift (an all-NaN window) is
+    incomplete, is re-derived per window, and never puts NaN in
+    ``cache_meta.json``.
+    """
+    if transform is None:
+        return {"transform": None}
+    t = series.attrs.get("transform", transform)
+    if t == "sqrt":
+        return {"transform": t}
+    shift = series.attrs.get("transform_shift")
+    low = series.attrs.get("transform_min")
+    if shift is None or low is None or not (np.isfinite(shift) and np.isfinite(low)):
+        return {"transform": t}
+    return {"transform": t, "shift": float(shift), "min": float(low)}
+
+
+def _describe_transform(series) -> str:
+    """``log (shift 1)`` for the covariate manifest line; '' untransformed."""
+    t = series.attrs.get("transform")
+    if t is None:
+        return ""
+    shift = series.attrs.get("transform_shift")
+    return f"{t} (shift {shift:g})" if shift is not None else t
+
+
+def _transform_label(t):
+    """``box_cox`` is recorded as ``shifted_log``, the name apply_transform
+    gives it."""
+    return "shifted_log" if t == "box_cox" else t
+
+
+def _transform_record_complete(rec) -> bool:
+    t = rec.get("transform")
+    return t is None or t == "sqrt" or rec.get("shift") is not None
+
+
+def _apply_covariate_transform(series, rec: dict):
+    if rec.get("transform") is None:
+        return series
+    from ml_forecast_lab.preprocessing import apply_transform
+    return apply_transform(
+        series, rec["transform"], shift=rec.get("shift"), lower=rec.get("min"),
+    )
+
+
+def _future_covariate_on_model_scale(series, cov_cfg, cov_name, transforms):
+    """A covariate's fetched forecast on the scale its history was fed at:
+    ``scale``, then the transform recorded for this cycle's history (the
+    YAML one when nothing was recorded).
+
+    v2.54.0: the four future-value paths applied ``scale`` only, so a
+    covariate with ``transform`` reached the model raw at every horizon step
+    while it trained on transformed values. Returns None when a log shift
+    cannot be reproduced; the caller then carries the covariate forward
+    rather than feed it raw.
+    """
+    if cov_cfg.scale is not None:
+        series = series * cov_cfg.scale
+    rec = (transforms or {}).get(cov_name) or {"transform": cov_cfg.transform}
+    if rec.get("transform") is None:
+        return series
+    if not _transform_record_complete(rec):
+        return None
+    return _apply_covariate_transform(series, rec)
 
 
 def _covariate_fill_values(df, feature_cols, computed) -> dict:
@@ -662,7 +735,7 @@ def _reinstate_trained_covariates(df, feature_cols, computed):
     """Give back, as all-NaN columns, covariates the model was fitted on but
     the fresh fetch left out. Returns ``(frame, reinstated)``.
 
-    v2.53.0: ``fetch_history`` returns an empty series on any HA error and
+    v2.54.0: ``fetch_history`` returns an empty series on any HA error and
     ``_fetch_and_preprocess`` then adds no column (a lagged-only column with
     0% coverage is dropped outright). Absent, the column bypassed
     ``resolve_missingness``: the tree row builder supplied 0.0, the pinned
@@ -1160,6 +1233,7 @@ def _cache_meta(cache: dict) -> dict:
             cache.get("missing_indicators") or []
         ),
         "covariate_fill": dict(cache.get("covariate_fill") or {}),
+        "covariate_transforms": dict(cache.get("covariate_transforms") or {}),
         "trained_at": cache["trained_at"].isoformat(),
         "model_version": cache["model_version"],
         "is_neural": is_neural,
@@ -1236,6 +1310,9 @@ def _cache_entry_from_meta(meta: dict, model, exp_cfg) -> dict:
             meta.get("missing_indicators") or []
         ),
         "covariate_fill": dict(meta.get("covariate_fill") or {}),
+        # Absent before v2.54.0: each forecast then re-derives the shift
+        # from its own window, as those releases did, until the next retrain.
+        "covariate_transforms": dict(meta.get("covariate_transforms") or {}),
         "combined": None,  # re-fetched on first forecast
         "exp_cfg": exp_cfg,
         "trained_at": trained_at,
@@ -2077,7 +2154,7 @@ class MLForecastLabApp:
 
         Computed for whichever of the two is in ``cov_cols`` — the columns
         the tree was trained on — so the recursive loops never carry the
-        ``last_ts`` value across the horizon. v2.53.0: and in ``computed``
+        ``last_ts`` value across the horizon. v2.54.0: and in ``computed``
         (``_computed_source_columns``), so a sensor the tree was trained on
         under that name is not swapped for pvlib values. None when neither
         is present, the site location is unknown, or pvlib fails.
@@ -2856,6 +2933,7 @@ class MLForecastLabApp:
 
     async def _fetch_and_preprocess(
         self, exp_cfg, now: Optional[datetime] = None,
+        covariate_transforms: Optional[dict] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch history and preprocess for an experiment.
@@ -3222,10 +3300,32 @@ class MLForecastLabApp:
                     if cov_cfg.scale is not None:
                         cov_series = cov_series * cov_cfg.scale
 
-                    # Apply transform if configured
-                    if cov_cfg.transform is not None:
-                        from ml_forecast_lab.preprocessing import apply_transform
-                        cov_series = apply_transform(cov_series, cov_cfg.transform)
+                    # Apply transform if configured. v2.54.0: a complete
+                    # record in ``covariate_transforms`` (pinned from the
+                    # model cache) is applied as recorded, whatever the YAML
+                    # now says; otherwise the transform is derived from this
+                    # window and its record written back for the caller.
+                    _rec = (covariate_transforms or {}).get(canonical_name)
+                    if _rec is not None and _transform_record_complete(_rec):
+                        cov_series = _apply_covariate_transform(cov_series, _rec)
+                        if _transform_label(_rec.get("transform")) != _transform_label(cov_cfg.transform):
+                            logger.info(
+                                f"    {cov_cfg.entity}: forecasting with the "
+                                f"transform the model was trained with "
+                                f"({_rec.get('transform')}); the configured "
+                                f"transform ({cov_cfg.transform}) takes effect "
+                                f"at the next retrain."
+                            )
+                    else:
+                        _t = _rec["transform"] if _rec is not None else cov_cfg.transform
+                        if _t is not None:
+                            from ml_forecast_lab.preprocessing import apply_transform
+                            cov_series = apply_transform(cov_series, _t)
+                        if covariate_transforms is not None:
+                            covariate_transforms[canonical_name] = (
+                                _covariate_transform_record(cov_series, _t)
+                            )
+                    _tx_desc = _describe_transform(cov_series)
 
                     # Align to target index and merge.
                     #
@@ -3260,6 +3360,7 @@ class MLForecastLabApp:
                         f"{observed_count}/{grid_points} observed "
                         f"({cov_pct:.1f}%), {filled_count} masked"
                         f"{f', scaled ×{cov_cfg.scale}' if cov_cfg.scale else ''}"
+                        f"{f', {_tx_desc}' if _tx_desc else ''}"
                     )
                     cov_stats.append({
                         "entity": cov_cfg.entity,
@@ -5071,7 +5172,10 @@ class MLForecastLabApp:
         logger.info(f"{'=' * 60}")
 
         # 1. Fetch and preprocess
-        df = await self._fetch_and_preprocess(exp_cfg)
+        prod_cov_transforms: dict = {}
+        df = await self._fetch_and_preprocess(
+            exp_cfg, covariate_transforms=prod_cov_transforms,
+        )
         if df is None:
             return
 
@@ -5292,8 +5396,11 @@ class MLForecastLabApp:
                             )
                             if future_series is None or future_series.empty:
                                 continue
-                            if cov_cfg.scale is not None:
-                                future_series = future_series * cov_cfg.scale
+                            future_series = _future_covariate_on_model_scale(
+                                future_series, cov_cfg, cov_name, prod_cov_transforms,
+                            )
+                            if future_series is None:
+                                continue
                             aligned = future_series.reindex(future_index_prod).ffill().bfill()
                             if aligned.notna().any():
                                 future_cov_inf[cov_name] = aligned
@@ -5400,8 +5507,11 @@ class MLForecastLabApp:
                                 cov_dict, future_index,
                             )
                             if future_series is not None and not future_series.empty:
-                                if cov_cfg.scale is not None:
-                                    future_series = future_series * cov_cfg.scale
+                                future_series = _future_covariate_on_model_scale(
+                                    future_series, cov_cfg, cov_name,
+                                    prod_cov_transforms,
+                                )
+                            if future_series is not None and not future_series.empty:
                                 aligned = future_series.reindex(
                                     future_index
                                 ).ffill().bfill()
@@ -5473,7 +5583,11 @@ class MLForecastLabApp:
                     window = buf[-w:] if len(buf) >= w else buf
                     if window:
                         row[f'y_rolling_mean_{w}'] = float(np.mean(window))
-                        row[f'y_rolling_std_{w}'] = float(np.std(window))
+                        # v2.54.0: ddof=1, as pandas' rolling std in
+                        # build_features; np.std defaults to ddof=0.
+                        row[f'y_rolling_std_{w}'] = (
+                            float(np.std(window, ddof=1)) if len(window) > 1 else 0.0
+                        )
                         row[f'y_rolling_max_{w}'] = float(np.max(window))
                     else:
                         row[f'y_rolling_mean_{w}'] = 0.0
@@ -6149,7 +6263,10 @@ class MLForecastLabApp:
             prod_model_name = exp_cfg.models_enabled[0] if exp_cfg.models_enabled else "lightgbm"
         return prod_model_name
 
-    async def _prepare_training_frame(self, exp_cfg, now: Optional[datetime] = None):
+    async def _prepare_training_frame(
+        self, exp_cfg, now: Optional[datetime] = None,
+        covariate_transforms: Optional[dict] = None,
+    ):
         """Fetch, build features and resolve missingness for a retrain.
 
         Returns ``(grid_df, combined, missing_report)`` or ``None`` when the
@@ -6159,7 +6276,9 @@ class MLForecastLabApp:
         """
         from ml_forecast_lab.features import build_features
 
-        df = await self._fetch_and_preprocess(exp_cfg, now=now)
+        df = await self._fetch_and_preprocess(
+            exp_cfg, now=now, covariate_transforms=covariate_transforms,
+        )
         if df is None:
             return None
         features_df = build_features(
@@ -6329,7 +6448,10 @@ class MLForecastLabApp:
                 )
 
         # Fetch and prepare data
-        prepared = await self._prepare_training_frame(exp_cfg)
+        cov_transforms: dict = {}
+        prepared = await self._prepare_training_frame(
+            exp_cfg, covariate_transforms=cov_transforms,
+        )
         if prepared is None:
             return
         df, combined, missing_report = prepared
@@ -6499,6 +6621,10 @@ class MLForecastLabApp:
             "covariate_fill": _covariate_fill_values(
                 df, feature_cols, _computed_source_columns(exp_cfg),
             ),
+            # The transform each covariate's history went through, shift
+            # included: forecasts apply it as recorded rather than re-derive
+            # it from a window that has slid since.
+            "covariate_transforms": cov_transforms,
             "combined": combined,
             "exp_cfg": exp_cfg,
             "trained_at": trained_at,
@@ -7840,8 +7966,11 @@ class MLForecastLabApp:
         used_fresh_frame = False
         fetch_error = None
         diag: dict = {}
+        cov_transforms = dict(cache.get("covariate_transforms") or {})
         try:
-            df_fresh = await self._fetch_and_preprocess(exp_cfg, now=now)
+            df_fresh = await self._fetch_and_preprocess(
+                exp_cfg, now=now, covariate_transforms=cov_transforms,
+            )
             if df_fresh is None:
                 logger.warning(f"  Skipping forecast cycle for {exp_cfg.name} — insufficient data")
                 return CachedForecast(
@@ -7860,7 +7989,7 @@ class MLForecastLabApp:
             if _reinstated:
                 # Flagged only where the model was fitted with that
                 # covariate's indicator; one trained gap-free has none.
-                # A cache from before v2.53.0 has no fill: 0.0.
+                # A cache from before v2.54.0 has no fill: 0.0.
                 _pinned_src = set(_pinned_indicator_map(
                     cache.get("missing_indicators") or [], feature_cols,
                 ).values())
@@ -7917,6 +8046,8 @@ class MLForecastLabApp:
         except Exception as e:
             logger.warning(f"  Fresh data fetch failed, using cached data: {e}")
             fetch_error = f"{type(e).__name__}: {e}"
+            # The cached frame went through the training-time transforms.
+            cov_transforms = dict(cache.get("covariate_transforms") or {})
             combined = cache.get("combined")
             if combined is None:
                 # _restore_cached_models deliberately doesn't persist the
@@ -8044,8 +8175,11 @@ class MLForecastLabApp:
                             )
                             if future_series is None or future_series.empty:
                                 continue
-                            if cov_cfg.scale is not None:
-                                future_series = future_series * cov_cfg.scale
+                            future_series = _future_covariate_on_model_scale(
+                                future_series, cov_cfg, cov_name, cov_transforms,
+                            )
+                            if future_series is None:
+                                continue
                             aligned = future_series.reindex(future_index).ffill().bfill()
                             # All-NaN aligned series → leave the
                             # channel at zero (build_inference_window's
@@ -8249,8 +8383,10 @@ class MLForecastLabApp:
                                 cov_dict, future_index,
                             )
                             if future_series is not None and not future_series.empty:
-                                if cov_cfg.scale is not None:
-                                    future_series = future_series * cov_cfg.scale
+                                future_series = _future_covariate_on_model_scale(
+                                    future_series, cov_cfg, cov_name, cov_transforms,
+                                )
+                            if future_series is not None and not future_series.empty:
                                 aligned = future_series.reindex(
                                     future_index
                                 ).ffill().bfill()
@@ -8320,7 +8456,11 @@ class MLForecastLabApp:
                     window = buf[-w:] if len(buf) >= w else buf
                     if window:
                         row[f'y_rolling_mean_{w}'] = float(np.mean(window))
-                        row[f'y_rolling_std_{w}'] = float(np.std(window))
+                        # v2.54.0: ddof=1, as pandas' rolling std in
+                        # build_features; np.std defaults to ddof=0.
+                        row[f'y_rolling_std_{w}'] = (
+                            float(np.std(window, ddof=1)) if len(window) > 1 else 0.0
+                        )
                         row[f'y_rolling_max_{w}'] = float(np.max(window))
                     else:
                         row[f'y_rolling_mean_{w}'] = 0.0

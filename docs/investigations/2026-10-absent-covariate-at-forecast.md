@@ -1,6 +1,6 @@
-# Silent zeros at forecast time (v2.53.0)
+# Silent zeros at forecast time (v2.54.0)
 
-**Status:** Shipped in v2.53.0. Defects where the recursive tree forecast
+**Status:** Shipped in v2.54.0. Defects where the recursive tree forecast
 fed a model 0.0 for a feature it was trained on with real values, the fixes,
 and why no model-cache schema bump.
 
@@ -125,11 +125,8 @@ flagged, never worse than before. The next scheduled retrain writes it.
   fill is fed unflagged. This is the same accepted behaviour as a
   present-but-NaN tail today. The reinstatement warning lists flagged and
   unflagged covariates separately.
-- **Found in the same review, not fixed here:**
-  - `cov_cfg.transform` is applied to covariate history but not to future
-    values. The future paths apply only `scale`, so a future-role covariate
-    with a `transform` gets future values on a different scale from training.
-  - Both recursive builders compute `y_rolling_std_*` with `np.std`
-    (`ddof=0`), while `build_features` uses pandas rolling std (`ddof=1`).
-    That is about 9% low for the 6-row window at 30-minute data, on every
-    tree forecast.
+- **Found in the same review, fixed in the same release:** the covariate
+  `transform` was applied to history but not to future values, and was
+  re-derived per window. The recursive builders also computed
+  `y_rolling_std_*` with `ddof=0`. See
+  [`2026-10-forecast-input-scale.md`](2026-10-forecast-input-scale.md).

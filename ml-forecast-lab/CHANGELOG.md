@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.53.0
+## 2.54.0
 
 ### Fixed
 
@@ -15,6 +15,18 @@
 - Until a model is retrained on this version, it still gets 0 in that case,
   but the log now says so.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Covariates with a `transform` get forecast values on the scale they were trained on.**
+
+- If a covariate in `mlfl.yaml` had `transform` set, its forecast values
+  reached the model untransformed, which could pull forecasts well off.
+- For a covariate that goes below zero, or now and then reads exactly zero,
+  the transform could also drift between retrains.
+- Each covariate's transform is now fixed when the model is trained and used
+  for both its history and its forecast values.
+- Forecasts for these experiments change after the update, so compare their
+  accuracy from after the next retrain.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-forecast-input-scale.md)
 
 **Public holidays reach the forecast.**
 
@@ -31,6 +43,14 @@
   given the app's own sun position in its place.
 - They are now fed their real values, so forecasts that use them can change.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Tree-model forecasts measure recent ups and downs the way training did.**
+
+- Tree models learned from how much the sensor had varied over its last few
+  readings, but when forecasting were given a figure up to about 9% smaller.
+- They are now given the same figure, so their forecasts can shift slightly.
+- Benchmark scores and rankings are unchanged.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-forecast-input-scale.md)
 
 ## 2.52.7
 

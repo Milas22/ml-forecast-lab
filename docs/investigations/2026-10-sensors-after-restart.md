@@ -165,5 +165,5 @@ non-cumulative sources: it would only duplicate `_forecast`.
   restart until the next retrain or benchmark (see above).
 - **Not availability, found in the same review:** a covariate column absent at
   forecast time reached the tree path as 0.0, with its pinned `_missing`
-  indicator zero-filled. This was fixed in v2.53.0; see
+  indicator zero-filled. This was fixed in v2.54.0; see
   [2026-10-absent-covariate-at-forecast.md](2026-10-absent-covariate-at-forecast.md).

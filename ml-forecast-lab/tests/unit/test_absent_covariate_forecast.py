@@ -1,4 +1,4 @@
-"""v2.53.0: the forecast feeds models what they were trained on, never a silent 0.0.
+"""v2.54.0: the forecast feeds models what they were trained on, never a silent 0.0.
 
 Defects pinned (all live up to v2.52.7):
 - A covariate the model was trained on but that returned no history at
@@ -110,8 +110,8 @@ def _train(tmp_path, monkeypatch, *, backend="lightgbm", covs=None, ents=None,
     )
     orig = MLForecastLabApp._prepare_training_frame
 
-    async def _at_now(self, exp_cfg, now=None, _o=orig, _n=now):
-        return await _o(self, exp_cfg, now=_n)
+    async def _at_now(self, exp_cfg, now=None, _o=orig, _n=now, **kw):
+        return await _o(self, exp_cfg, now=_n, **kw)
 
     monkeypatch.setattr(MLForecastLabApp, "_prepare_training_frame", _at_now)
 
