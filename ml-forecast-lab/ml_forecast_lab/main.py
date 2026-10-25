@@ -1401,6 +1401,7 @@ class MLForecastLabApp:
                     # First load — no config to fall back to
                     logger.error(f"Failed to load configuration: {e}", exc_info=True)
                     self.config = self._create_stub_config()
+                    self._config_is_stub = True
 
     def _create_stub_config(self):
         """Create a minimal stub configuration for testing."""
@@ -1593,7 +1594,7 @@ class MLForecastLabApp:
                         started_at = datetime.now(timezone.utc)
                         try:
                             self.web_app.state.appstate.start_benchmark(experiment_name)
-                            await self._run_benchmark(exp_cfg)
+                            ran = await self._run_benchmark(exp_cfg)
                         except Exception as e:
                             logger.error(f"Benchmark failed: {e}", exc_info=True)
                             # v2.52.7: the Training-tab benchmark never posted
@@ -1603,8 +1604,8 @@ class MLForecastLabApp:
                                 {"error": str(e)[:200]},
                             )
                         else:
-                            await self._publish_benchmark_completed(
-                                exp_cfg, started_at,
+                            await self._publish_benchmark_outcome(
+                                exp_cfg, started_at, ran,
                             )
                         finally:
                             self.web_app.state.appstate.end_benchmark(experiment_name)
@@ -1884,8 +1885,9 @@ class MLForecastLabApp:
                 return
 
             _started_at = datetime.now(timezone.utc)
+            ran = None
             if is_lab_mode:
-                await self._run_benchmark(exp_cfg)
+                ran = await self._run_benchmark(exp_cfg)
             else:
                 await self._run_production_inference(exp_cfg)
 
@@ -1902,7 +1904,7 @@ class MLForecastLabApp:
 
             # Publish lifecycle sensor for HA automations
             if is_lab_mode:
-                await self._publish_benchmark_completed(exp_cfg, _started_at)
+                await self._publish_benchmark_outcome(exp_cfg, _started_at, ran)
 
         except Exception as e:
             logger.error(
@@ -3959,7 +3961,9 @@ class MLForecastLabApp:
         # 1. Fetch and preprocess data
         df = await self._fetch_and_preprocess(exp_cfg)
         if df is None:
-            return
+            # v2.52.7: reported so _last_benchmark isn't posted "completed"
+            # for a benchmark that never ran.
+            return False
 
         # Count measured labels, not grid slots. `_fetch_and_preprocess`
         # now returns the complete grid, so `len(df)` includes rows that can
@@ -4916,6 +4920,7 @@ class MLForecastLabApp:
             experiment_name=exp_cfg.name,
             message=f"Benchmark complete — best model: {best_model_name}",
         ))
+        return True
 
     @staticmethod
     def _build_window_channels(df_slice, cov_cols, target_col='target'):
@@ -5794,21 +5799,35 @@ class MLForecastLabApp:
             self._forecast_failures, timedelta(minutes=fc_mins),
         )
 
-    def _expected_entities(self, exp_cfg) -> set:
-        """Every entity id a production experiment posts under its current
-        config (forecast family, bands at its ``conformal_coverage`` level,
-        ``_interval`` for cumulative sources, lifecycle sensors)."""
+    @staticmethod
+    def _forecast_entities(exp_cfg) -> set:
+        """The forecast-family ids posted under *exp_cfg* (bands at its
+        ``conformal_coverage`` level, ``_interval`` for cumulative sources)."""
         publish_name = exp_cfg.publish_name or exp_cfg.name
         base = f"sensor.{exp_cfg.publish_prefix}{publish_name}"
-        life = f"sensor.{exp_cfg.publish_prefix or 'mlfl_'}{publish_name}"
         pct = int(round(float(getattr(exp_cfg, "conformal_coverage", 0.8)) * 100))
         ids = {
             f"{base}_forecast", f"{base}_cumulative", f"{base}_upper_{pct}",
             f"{base}_lower_{pct}", f"{base}_forecast_accuracy",
-            f"{life}_last_retrain", f"{life}_last_benchmark",
         }
         if exp_cfg.source_is_cumulative:
             ids.add(f"{base}_interval")
+        return ids
+
+    @staticmethod
+    def _lifecycle_entities(exp_cfg) -> set:
+        life = f"sensor.{exp_cfg.publish_prefix or 'mlfl_'}{exp_cfg.publish_name or exp_cfg.name}"
+        return {f"{life}_last_retrain", f"{life}_last_benchmark"}
+
+    def _live_forecast_entities(self, exp_cfg) -> set:
+        """Forecast ids a production experiment may post now: forecasts
+        publish with the ``exp_cfg`` cached at the last retrain, so a
+        renamed ``publish_name`` or changed ``conformal_coverage`` only
+        moves to the new ids at the next retrain."""
+        ids = self._forecast_entities(exp_cfg)
+        cached_cfg = (self._cached_models.get(exp_cfg.name) or {}).get("exp_cfg")
+        if cached_cfg is not None:
+            ids |= self._forecast_entities(cached_cfg)
         return ids
 
     def _record_published(self, exp_name: str, entity_ids: list) -> None:
@@ -5855,9 +5874,12 @@ class MLForecastLabApp:
     async def _retire_orphaned_sensors(self) -> None:
         """v2.52.7: remove sensors the app posted but no longer produces.
 
-        A renamed ``publish_name``/``publish_prefix``, a changed
-        ``conformal_coverage``, an experiment switched to lab or removed:
-        the old ids used to keep their last value until HA restarted. An id
+        An experiment switched to lab or removed (its forecast ids), or one
+        whose ``publish_name``/``publish_prefix``/``conformal_coverage``
+        changed (its old ids, once the next retrain moves its forecasts to
+        the new ones): the old ids used to keep their last value until HA
+        restarted. The ``_last_<event>`` ids stay while the experiment
+        exists, whatever its mode. An id
         is removed once it has been unexpected in two consecutive checks,
         so a config reload caught mid-write can't remove live sensors; never
         while the config is the no-file stub or lists no experiments. Only
@@ -5870,8 +5892,9 @@ class MLForecastLabApp:
         from ml_forecast_lab.ha_interface import HAResponseError
         expected = set()
         for e in self.config.experiments:
+            expected |= self._lifecycle_entities(e)
             if e.mode == "production":
-                expected |= self._expected_entities(e)
+                expected |= self._live_forecast_entities(e)
         candidates = {eid for eid in self._published_entities if eid not in expected}
         due = candidates & self._orphan_candidates
         self._orphan_candidates = candidates - due
@@ -5952,7 +5975,7 @@ class MLForecastLabApp:
         payloads = []
         n_exps = 0
         for e in experiments:
-            expected = self._expected_entities(e)
+            expected = self._live_forecast_entities(e)
             mine = [p for p in self._last_payloads.get(e.name, []) if p[0] in expected]
             if mine:
                 n_exps += 1
@@ -6589,7 +6612,8 @@ class MLForecastLabApp:
         old status mirror never ran: an experiment with a restored model
         but no saved benchmark result showed "Pending" and no model while
         it forecast normally. Fills only what the saved benchmark left
-        unset; the deployed ``model_version`` always comes from the model.
+        unset; ``model_version`` is set only when ``best_model`` is the
+        deployed model.
         """
         if not self.web_app:
             return
@@ -6598,10 +6622,12 @@ class MLForecastLabApp:
             st = statuses.get(name)
             if st is None:
                 continue
-            if entry.get("model_version"):
-                st.model_version = entry["model_version"]
+            # model_version is the default analytics filter when the
+            # selected model is best_model, so it must belong to that model.
             if not st.best_model:
                 st.best_model = entry.get("model_name")
+            if entry.get("model_version") and st.best_model == entry.get("model_name"):
+                st.model_version = entry["model_version"]
             if st.last_benchmark_status == "pending":
                 st.last_benchmark_status = "completed"
                 trained_at = entry.get("trained_at")
@@ -9830,9 +9856,18 @@ class MLForecastLabApp:
         finally:
             await self.shutdown()
 
-    async def _publish_benchmark_completed(self, exp_cfg, started_at: datetime) -> None:
-        """Post ``_last_benchmark`` for a completed benchmark, with its
-        duration and winner."""
+    async def _publish_benchmark_outcome(
+        self, exp_cfg, started_at: datetime, ran: Optional[bool],
+    ) -> None:
+        """Post ``_last_benchmark`` after a benchmark that raised nothing:
+        ``failed`` when it found no measured target data (*ran* False),
+        else ``completed`` with its duration and this run's winner."""
+        if ran is False:
+            await self._publish_lifecycle_sensor(
+                exp_cfg, "benchmark", "failed",
+                {"error": "no measured target data in the history window"},
+            )
+            return
         duration = (datetime.now(timezone.utc) - started_at).total_seconds()
         attrs = {"duration_seconds": round(duration, 1)}
         br = (self.web_app.state.appstate.benchmark_results.get(exp_cfg.name)

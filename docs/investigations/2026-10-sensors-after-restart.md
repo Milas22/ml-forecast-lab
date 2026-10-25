@@ -122,17 +122,31 @@ wrong.
 posts (forecast family and lifecycle) to its experiment and mirrors it to
 `/data/ml_forecast_lab/published_entities.json`. Each minute's
 `_check_ha_states` (when HA answers) calls `_retire_orphaned_sensors`.
-- The expected set is computed from the config, not from the last payloads:
-  `_expected_entities` gives the forecast family, the bands at
-  `conformal_coverage`, `_interval` for cumulative sources, and the lifecycle
-  ids. So an id that a renamed experiment still produces under the same
+- The expected set is computed from configuration, not from the last
+  payloads, so an id a renamed experiment still produces under the same
   `publish_name` is never touched, even before that experiment's first
   forecast.
+  - It includes the lifecycle ids (`_lifecycle_entities`) of every configured
+    experiment, whatever its mode: lab experiments post `_last_benchmark` too.
+  - For production experiments it includes the forecast family
+    (`_forecast_entities`: bands at `conformal_coverage`, `_interval` for
+    cumulative sources) under both the current config and the `exp_cfg`
+    cached at the last retrain (`_live_forecast_entities`).
+- The cached `exp_cfg` matters because forecasts publish with it. A review
+  caught an earlier draft that used the config alone. After a
+  `publish_name`, `publish_prefix` or `conformal_coverage` edit it deleted the
+  still-posted old ids every tick until the next retrain, and the next tick
+  re-created them.
 - An id is deleted (`DELETE /api/states/<id>`) only after it has been
-  unexpected in two consecutive checks. A config reload caught mid-write, or
-  the stub config used when no file is found (`_config_is_stub`), therefore
-  can't remove live sensors; nothing runs while the config lists no
-  experiments.
+  unexpected in two consecutive checks. A config reload caught mid-write
+  therefore can't remove live sensors.
+- Nothing runs while the config is the stub (`_config_is_stub`), which is used
+  both when no file is found and when the first load fails to parse, or while
+  the config lists no experiments.
+- HA Core has supported `DELETE /api/states/<id>` for years (admin only; the
+  Supervisor token is admin). The Supervisor proxy forwards DELETE on
+  `/core/api/...` only from Supervisor 2026.02.0 (commit 7ad9a911); older
+  versions answer 405, which disables the cleanup with one warning.
 - Only ids this app recorded are candidates, so ids posted before v2.52.7 are
   left alone; HA drops those at its next restart anyway.
 - A 404 still clears the record. An unreachable HA keeps the id for the next

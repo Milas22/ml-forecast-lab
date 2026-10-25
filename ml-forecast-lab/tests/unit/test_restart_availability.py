@@ -530,16 +530,31 @@ class TestTrainingTabBenchmarkSensor:
                 "solar": types.SimpleNamespace(best_model_name="nhits"),
             })))
         started = datetime.now(timezone.utc) - timedelta(seconds=90)
-        asyncio.run(app._publish_benchmark_completed(exp, started))
+        asyncio.run(app._publish_benchmark_outcome(exp, started, True))
         state, attrs = app.ha_interface.posted()["sensor.mlfl_solar_last_benchmark"]
         assert attrs["outcome"] == "completed" and attrs["winner"] == "nhits"
         assert attrs["duration_seconds"] == pytest.approx(90, abs=2)
 
+    def test_benchmark_that_ran_nothing_is_reported_failed(self):
+        exp = _exp()
+        app = _make_app(exp)
+        asyncio.run(app._publish_benchmark_outcome(exp, datetime.now(timezone.utc), False))
+        _, attrs = app.ha_interface.posted()["sensor.mlfl_solar_last_benchmark"]
+        assert attrs["outcome"] == "failed"
+        assert "no measured target data" in attrs["error"]
+        assert "winner" not in attrs
+
     def test_benchmark_trigger_posts_on_completion_and_failure(self):
         src = inspect.getsource(MLForecastLabApp.start_web_server)
         trigger = src[src.index("async def _benchmark_trigger"):src.index("benchmark_callback = _benchmark_trigger")]
-        assert "self._publish_benchmark_completed(" in trigger
+        assert "ran = await self._run_benchmark(exp_cfg)" in trigger
+        assert "self._publish_benchmark_outcome(" in trigger
         assert '"benchmark", "failed"' in trigger
+
+    def test_run_benchmark_reports_whether_it_ran(self):
+        src = inspect.getsource(MLForecastLabApp._run_benchmark)
+        assert "if df is None:" in src and "return False" in src
+        assert src.rstrip().endswith("return True")
 
 
 # --- dashboard card after a restart --------------------------------------
@@ -576,6 +591,13 @@ class TestRestoredModelsOnTheDashboard:
         assert st.best_model == "nhits"
         assert st.last_benchmark_status == "failed"
         assert st.last_benchmark_timestamp == "2026-10-20T09:15:00+00:00"
+        # v7 belongs to lightgbm, not the saved winner: it would mis-filter
+        # the Accuracy tab, which defaults to model_version for best_model.
+        assert st.model_version is None
+
+    def test_model_version_set_when_the_winner_is_deployed(self):
+        st = _status(best_model="lightgbm", last_benchmark_status="completed")
+        self._app(st)._sync_restored_models_to_ui()
         assert st.model_version == "v7"
 
     def test_run_syncs_after_the_web_app_starts(self):
@@ -700,6 +722,42 @@ class TestOrphanedSensors:
         posted = app.ha_interface.posted()
         assert "sensor.mlfl_solar_forecast" in posted
         assert "sensor.mlfl_solar_upper_80" not in posted
+
+    def test_renamed_sensors_kept_until_the_retrain_moves_them(self):
+        # Forecasts publish with the exp_cfg cached at the last retrain.
+        app, exp = self._app()
+        app._cached_models["solar"] = {"model_name": "lightgbm", "exp_cfg": exp}
+        app.config.experiments = [_exp(publish_name="pv", conformal_coverage=0.9)]
+        self._check(app)
+        self._check(app)
+        assert not any("_forecast" in e or "_80" in e for e in app.ha_interface.deleted)
+        # The retrain caches the new config: the old ids are now orphans.
+        app._cached_models["solar"]["exp_cfg"] = app.config.experiments[0]
+        self._check(app)
+        self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.deleted
+        assert "sensor.mlfl_solar_upper_80" in app.ha_interface.deleted
+
+    def test_lab_experiments_keep_their_lifecycle_sensors(self):
+        app, exp = self._app()
+        asyncio.run(app._publish_lifecycle_sensor(exp, "benchmark", "completed"))
+        app.config.experiments = [_exp(mode="lab")]
+        self._check(app)
+        self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.deleted
+        assert "sensor.mlfl_solar_last_benchmark" not in app.ha_interface.deleted
+        assert "sensor.mlfl_solar_last_retrain" not in app.ha_interface.deleted
+
+    def test_unparseable_config_on_first_load_is_treated_as_stub(self, tmp_path):
+        bad = tmp_path / "mlfl.yaml"
+        bad.write_text("experiments:\n\t- name: solar\n")
+        app, _ = self._app()
+        app.config = None
+        asyncio.run(app.load_config(config_path=bad))
+        assert app._config_is_stub is True
+        self._check(app)
+        self._check(app)
+        assert app.ha_interface.deleted == []
 
     def test_run_restores_the_record_before_main_loop(self):
         src = inspect.getsource(MLForecastLabApp.run)

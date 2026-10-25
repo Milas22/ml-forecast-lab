@@ -26,8 +26,8 @@
 - They now show "unknown", with a `status` attribute saying why.
 - For forecasts that can't go below zero, such as solar power, set
   `target_is_nonnegative: true` so the cumulative sensor gets a value; it
-  takes effect at the next retrain and also treats missing night-time
-  readings as zero, so solar forecasts can shift slightly.
+  takes effect at the next retrain and also trains solar experiments with
+  every night-time reading set to zero, so their forecasts can shift.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
 
 **Sensors from renamed or lab experiments are removed.**
@@ -35,7 +35,9 @@
 - After renaming an experiment's sensors, changing its band coverage or
   switching it to lab, the old sensors kept their last values until Home
   Assistant restarted.
-- The app now removes sensors it no longer updates within about two minutes.
+- The app now removes them: within about two minutes for an experiment
+  switched to lab or deleted, and at the next retrain when its sensor names
+  or band coverage change.
 - It only removes sensors it created itself, from this version on.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
 
