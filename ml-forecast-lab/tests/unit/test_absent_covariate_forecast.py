@@ -21,6 +21,7 @@ past window would be invented, and the channel-parity guard refuses it.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib
 import inspect
 import logging
@@ -199,16 +200,51 @@ class TestAbsentCovariateTree:
             _col(res, cache, "temp"), _col(healthy, cache, "temp"),
         )
 
-    def test_old_cache_without_fill_is_flagged_not_silent(self, tmp_path, monkeypatch):
-        app, cache, ha, _ = _train(tmp_path, monkeypatch)
+    @pytest.mark.parametrize("gap", [True, False])
+    def test_old_cache_without_fill_is_logged_not_silent(self, tmp_path, monkeypatch, caplog, gap):
+        app, cache, ha, _ = _train(tmp_path, monkeypatch, gap=gap)
         old = dict(cache)
         old.pop("covariate_fill")
         ha.fail = {"sensor.temp"}
         _cold(app, ha)
-        res = _tick(app, old)
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            res = _tick(app, old)
         assert res.status == "ok"
         assert np.all(_col(res, old, "temp") == 0.0)
-        assert np.all(_col(res, old, "temp_missing") == 1.0)
+        zero = next(r.getMessage() for r in caplog.records
+                    if "imputed at 0.0" in r.getMessage())
+        held = next(r.getMessage() for r in caplog.records
+                    if "missing from this cycle's data" in r.getMessage())
+        if gap:
+            assert np.all(_col(res, old, "temp_missing") == 1.0)
+            assert "indicator raised for every row: ['temp']" in zero
+            assert "flagged as imputed: ['temp']" in held
+        else:
+            assert "temp_missing" not in old["feature_cols"]
+            assert "no indicator" in zero and "not flagged" in held
+
+    def test_future_role_covariate_keeps_its_forecast(self, tmp_path, monkeypatch, caplog):
+        gap_span = (NOW - timedelta(days=4, hours=6), NOW - timedelta(days=4))
+        covs = [CovariateCfg(entity="sensor.temp", role="future")]
+        ents = {"sensor.temp": _rows(_temp, NOW, skip=gap_span)}
+        app, cache, ha, _ = _train(tmp_path, monkeypatch, covs=covs, ents=ents)
+        ha.fail = {"sensor.temp"}
+        _cold(app, ha)
+
+        async def _forecast(cov, index):
+            return pd.Series(np.linspace(6.0, 14.0, len(index)), index=index)
+
+        app.covariate_resolver.fetch_future = _forecast
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            res = _tick(app, cache)
+        assert res.status == "ok"
+        assert res.diag["reinstated_covariates"] == ["temp"]
+        np.testing.assert_allclose(
+            _col(res, cache, "temp"), np.linspace(6.0, 14.0, len(res.ds_future)), rtol=1e-5,
+        )
+        msg = next(r.getMessage() for r in caplog.records
+                   if "missing from this cycle's data" in r.getMessage())
+        assert "use their forecast across the horizon" in msg and "held at" not in msg
 
     def test_gap_free_covariate_is_filled_but_not_flagged(self, tmp_path, monkeypatch, caplog):
         app, cache, ha, _ = _train(tmp_path, monkeypatch, gap=False)
@@ -224,6 +260,31 @@ class TestAbsentCovariateTree:
         msg = next(r.getMessage() for r in caplog.records
                    if "missing from this cycle's data" in r.getMessage())
         assert "not flagged" in msg and "flagged as imputed" not in msg
+
+    def test_solar_provenance_comes_from_the_model_not_the_live_config(self, tmp_path, monkeypatch):
+        """A restart attaches the live config; removing the sensor from
+        mlfl.yaml must not turn the trained column into a pvlib one."""
+        gap_span = (NOW - timedelta(days=4, hours=6), NOW - timedelta(days=4))
+        covs = [CovariateCfg(entity="sensor.sun_elevation", role="lagged"),
+                CovariateCfg(entity="sensor.temp", role="lagged")]
+        ents = {"sensor.sun_elevation": _rows(_temp, NOW, skip=gap_span),
+                "sensor.temp": _rows(lambda i: _temp(i + 9), NOW)}
+        app, cache, _, exp = _train(tmp_path, monkeypatch, covs=covs, ents=ents)
+        assert cache["computed_sources"] == ["clear_sky_ghi"]
+        live = dataclasses.replace(exp, covariates=covs[1:])
+        assert "sun_elevation" in _computed_source_columns(live)
+        meta = _cache_meta(cache)
+        restored = _cache_entry_from_meta(meta, cache["model"], live)
+        res = _tick(app, restored)
+        assert res.status == "ok"
+        assert res.diag["reinstated_covariates"] == ["sun_elevation"]
+        np.testing.assert_allclose(
+            _col(res, restored, "sun_elevation"),
+            cache["covariate_fill"]["sun_elevation"], rtol=1e-6,
+        )
+        assert np.all(_col(res, restored, "sun_elevation_missing") == 1.0)
+        meta.pop("computed_sources")
+        assert _cache_entry_from_meta(meta, cache["model"], live)["computed_sources"] is None
 
     def test_covariate_named_like_a_solar_column_is_filled(self, tmp_path, monkeypatch):
         gap_span = (NOW - timedelta(days=4, hours=6), NOW - timedelta(days=4))

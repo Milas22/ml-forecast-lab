@@ -586,20 +586,27 @@ def _seed_lag_buffer(grid_y, fallback, last_ts, n_values: int):
 
 def _computed_source_columns(exp_cfg) -> frozenset:
     """Solar columns ``exp_cfg`` gets from pvlib rather than from a sensor:
-    never filled or reinstated, and recomputed for every future step.
+    never filled or reinstated, and recomputed for every future step when
+    present in the fresh frame.
 
-    v2.54.0: decided from the config, not the name — a covariate on
-    ``sensor.sun_elevation`` is fetched like any other, so it is filled
-    when HA returns nothing for it and held like any lagged covariate
-    across the horizon. It counts as the user's only while
+    v2.54.0: decided from the config, not the name — a covariate on an
+    entity named ``sun_elevation`` is fetched like any other, so it is
+    filled when HA returns nothing for it and held like any lagged
+    covariate across the horizon. It counts as the user's only while
     ``include_sun_elevation`` is off (when on, the computed column
     overwrites it in ``_fetch_and_preprocess``). ``clear_sky_ghi`` is
     computed whatever its origin: build_features' night gate keys on the
     name, so an all-NaN column would zero every lag.
+
+    Evaluated at retrain and stored with the model (``computed_sources``):
+    after a restart the cache entry carries the live config, which may
+    have changed since.
     """
     out = {"clear_sky_ghi"}
-    # The entity's bare name, not _cov_column_name: that warns on duplicate
-    # configs, and a suffixed duplicate never yields a bare column anyway.
+    # The entity's bare name, not _cov_column_name, which warns on
+    # duplicate configs. Suffixed duplicates (``sun_elevation__a``) claim
+    # the bare name too; with the flag off no pvlib column of that name
+    # exists, so nothing a model is fed changes.
     fetched = {
         c.entity.split(".")[-1]
         for c in (getattr(exp_cfg, "covariates", None) or [])
@@ -740,13 +747,14 @@ def _reinstate_trained_covariates(df, feature_cols, computed):
     0% coverage is dropped outright). Absent, the column bypassed
     ``resolve_missingness``: the tree row builder supplied 0.0, the pinned
     indicator was zero-filled ("measured"), and the backstop never fired.
-    As an all-NaN column it is masked, imputed and flagged like any gap.
+    As an all-NaN column it is masked and imputed like any gap, and flagged
+    where the model pinned its indicator.
 
     Source columns are read off the fitted schema — build_features gives
     every one an ``_x_hour_sin`` pair — never off a name suffix. Columns in
     ``computed`` (``_computed_source_columns``) are left out. Placed in
-    fitted order so tree columns and neural channels line up. A frame
-    missing nothing is returned as the same object.
+    fitted order (cosmetic on the tree path; never called on the sequence
+    path). A frame missing nothing is returned as the same object.
     """
     sources = _fitted_source_columns(feature_cols)
     absent = [
@@ -761,6 +769,42 @@ def _reinstate_trained_covariates(df, feature_cols, computed):
     head = ["y"] + [c for c in sources if c in out.columns]
     placed = set(head)
     return out[head + [c for c in out.columns if c not in placed]], absent
+
+
+def _log_reinstated_covariates(name, reinstated, forecasted, fill, pinned, feature_cols):
+    """WARNING for covariates ``_reinstate_trained_covariates`` put back.
+
+    v2.54.0: one with a forecast this cycle uses it across the horizon; the
+    rest are held at their training fill, flagged only where the model was
+    fitted with that covariate's indicator (one trained gap-free has none).
+    A cache from before v2.54.0 has no fill: 0.0.
+    """
+    pinned_src = set(_pinned_indicator_map(pinned, feature_cols).values())
+    held = [c for c in reinstated if c not in forecasted]
+    notes = []
+    if held:
+        notes.append(
+            f"forecasting with {held} held at "
+            f"{ {c: fill.get(c, 0.0) for c in held} }"
+        )
+        flagged = [c for c in held if c in pinned_src]
+        unflagged = [c for c in held if c not in pinned_src]
+        if flagged:
+            notes.append(f"flagged as imputed: {flagged}")
+        if unflagged:
+            notes.append(
+                f"not flagged, as the model was trained with no gaps in "
+                f"them: {unflagged}"
+            )
+    forecast_only = [c for c in reinstated if c in forecasted]
+    if forecast_only:
+        notes.append(f"{forecast_only} use their forecast across the horizon")
+    logger.warning(
+        f"  {name}: covariate(s) {list(reinstated)} the model was trained on "
+        f"are missing from this cycle's data (no history returned, or "
+        f"removed from the config) — {'; '.join(notes)}. This lasts until "
+        f"the covariate returns or the next retrain."
+    )
 
 
 def _supervised_frame(
@@ -838,10 +882,26 @@ def _supervised_frame(
         c for c in report["empty_cols"] if c not in report.get("filled_cols", {})
     ]
     if _zero_filled:
+        # v2.54.0: an indicator exists only where the model was fitted with
+        # one (pinned at inference), so say which columns are flagged.
+        _ind = set(report.get("indicator_cols") or [])
+        _flagged = [
+            c for c in _zero_filled
+            if f"{c}{MISSING_SUFFIX}" in _ind or f"{c}{MISSING_SUFFIX}_flag" in _ind
+        ]
+        _unflagged = [c for c in _zero_filled if c not in _flagged]
+        _how = []
+        if _flagged:
+            _how.append(f"indicator raised for every row: {_flagged}")
+        if _unflagged:
+            _how.append(
+                f"no indicator, as the model was trained with no gaps in "
+                f"them: {_unflagged}"
+            )
         logger.warning(
             f"  {tag}Covariate(s) {_zero_filled} had no observations "
-            f"in the window — imputed at 0.0 with their indicator raised for "
-            f"every row. They carry no signal this cycle."
+            f"in the window — imputed at 0.0; {'; '.join(_how)}. They carry "
+            f"no signal this cycle."
         )
     return combined, report
 
@@ -1234,6 +1294,7 @@ def _cache_meta(cache: dict) -> dict:
         ),
         "covariate_fill": dict(cache.get("covariate_fill") or {}),
         "covariate_transforms": dict(cache.get("covariate_transforms") or {}),
+        "computed_sources": cache.get("computed_sources"),
         "trained_at": cache["trained_at"].isoformat(),
         "model_version": cache["model_version"],
         "is_neural": is_neural,
@@ -1313,6 +1374,8 @@ def _cache_entry_from_meta(meta: dict, model, exp_cfg) -> dict:
         # Absent before v2.54.0: each forecast then re-derives the shift
         # from its own window, as those releases did, until the next retrain.
         "covariate_transforms": dict(meta.get("covariate_transforms") or {}),
+        # Absent before v2.54.0: forecasts then decide from the live config.
+        "computed_sources": meta.get("computed_sources"),
         "combined": None,  # re-fetched on first forecast
         "exp_cfg": exp_cfg,
         "trained_at": trained_at,
@@ -6625,6 +6688,7 @@ class MLForecastLabApp:
             # included: forecasts apply it as recorded rather than re-derive
             # it from a window that has slid since.
             "covariate_transforms": cov_transforms,
+            "computed_sources": sorted(_computed_source_columns(exp_cfg)),
             "combined": combined,
             "exp_cfg": exp_cfg,
             "trained_at": trained_at,
@@ -7967,6 +8031,15 @@ class MLForecastLabApp:
         fetch_error = None
         diag: dict = {}
         cov_transforms = dict(cache.get("covariate_transforms") or {})
+        # Which solar columns pvlib supplies: decided at retrain and stored,
+        # since a restored entry carries the live config.
+        _computed = (
+            frozenset(cache["computed_sources"])
+            if cache.get("computed_sources") is not None
+            else _computed_source_columns(exp_cfg)
+        )
+        _reinstated: list = []
+        _fill = cache.get("covariate_fill") or {}
         try:
             df_fresh = await self._fetch_and_preprocess(
                 exp_cfg, now=now, covariate_transforms=cov_transforms,
@@ -7979,39 +8052,13 @@ class MLForecastLabApp:
                 )
             # Tree path only: a sequence model's past window would be
             # wholly invented, and the channel-parity guard already
-            # refuses that forecast rather than publish it.
-            _reinstated = []
-            _fill = cache.get("covariate_fill") or {}
+            # refuses that forecast rather than publish it. Logged once the
+            # tree path knows which of them have a forecast.
             if not (is_neural and 'sequence_data' in seq_kwargs):
                 df_fresh, _reinstated = _reinstate_trained_covariates(
-                    df_fresh, feature_cols, _computed_source_columns(exp_cfg),
+                    df_fresh, feature_cols, _computed,
                 )
             if _reinstated:
-                # Flagged only where the model was fitted with that
-                # covariate's indicator; one trained gap-free has none.
-                # A cache from before v2.54.0 has no fill: 0.0.
-                _pinned_src = set(_pinned_indicator_map(
-                    cache.get("missing_indicators") or [], feature_cols,
-                ).values())
-                _notes = []
-                _flagged = [c for c in _reinstated if c in _pinned_src]
-                _unflagged = [c for c in _reinstated if c not in _pinned_src]
-                if _flagged:
-                    _notes.append(f"flagged as imputed: {_flagged}")
-                if _unflagged:
-                    _notes.append(
-                        f"not flagged, as the model was trained with no "
-                        f"gaps in them: {_unflagged}"
-                    )
-                logger.warning(
-                    f"  {exp_cfg.name}: covariate(s) {_reinstated} the model "
-                    f"was trained on are missing from this cycle's data (no "
-                    f"history returned, or removed from the config) — "
-                    f"forecasting with them held at "
-                    f"{ {c: _fill.get(c, 0.0) for c in _reinstated} }; "
-                    f"{'; '.join(_notes)}. This lasts until the covariate "
-                    f"returns or the next retrain."
-                )
                 diag["reinstated_covariates"] = list(_reinstated)
             features_fresh = build_features(
                 df_fresh, target_col="y",
@@ -8409,6 +8456,11 @@ class MLForecastLabApp:
                                 f"  Future fetch failed for {cov_name}: {e}"
                             )
             diag["future_covariates"] = list(future_cov_values)
+            if _reinstated and used_fresh_frame:
+                _log_reinstated_covariates(
+                    exp_cfg.name, _reinstated, future_cov_values, _fill,
+                    cache.get("missing_indicators") or [], feature_cols,
+                )
             if future_cov_values:
                 logger.info(
                     f"  Fetched future covariate series for "
@@ -8424,7 +8476,7 @@ class MLForecastLabApp:
             # should NOT carry forward the last value — that would leave the
             # recursive forecast stuck in a single point of the day.
             future_solar = await self._future_solar_frame(
-                future_index, raw_cov_cols, _computed_source_columns(exp_cfg),
+                future_index, raw_cov_cols, _computed,
             )
 
             def _build_feature_row(ts: pd.Timestamp, buf: list, step_idx: int) -> dict:

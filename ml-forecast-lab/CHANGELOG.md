@@ -11,9 +11,10 @@
   normal.
 - All models now use the covariate's saved history when this happens.
 - With none saved, tree models use its typical value from training and the
-  log names the covariate; neural models skip that forecast until it is back.
-- Until a model is retrained on this version, it still gets 0 in that case,
-  but the log now says so.
+  log names the covariate; every other model skips that forecast until it is
+  back.
+- Until a tree model is retrained on this version, it still gets 0 in that
+  case, but the log now says so.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
 
 **Covariates with a `transform` get forecast values on the scale they were trained on.**
@@ -37,11 +38,14 @@
 
 **Covariates named like `y_…`, `…_missing` or `sun_elevation` keep their values.**
 
-- A covariate whose sensor name started with `y_` was fed 0 when forecasting,
-  and one ending in `_missing` lost part of its signal.
-- Tree models forecasting with a covariate sensor named `sun_elevation` were
-  given the app's own sun position in its place.
-- They are now fed their real values, so forecasts that use them can change.
+- In tree models, a covariate whose sensor name started with `y_` was fed 0
+  when forecasting, and one ending in `_missing` lost part of its signal.
+- With `include_sun_elevation` off, a covariate sensor named `sun_elevation`
+  was replaced by the app's own sun position when forecasting.
+- They are now fed their own readings like any other covariate, so forecasts
+  that use them can change.
+- If your `sun_elevation` sensor is the sun's elevation, set
+  `include_sun_elevation: true` so each forecast step gets its own value.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
 
 **Tree-model forecasts measure recent ups and downs the way training did.**
