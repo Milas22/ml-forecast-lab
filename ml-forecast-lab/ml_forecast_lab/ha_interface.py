@@ -474,6 +474,22 @@ class HAInterface:
             return None
         return True
 
+    async def delete_state(self, entity_id: str) -> Optional[bool]:
+        """Remove *entity_id*'s state from HA (``DELETE /api/states``).
+
+        v2.52.7: True when removed, False when HA had no such state, None
+        when HA is unreachable. Any other 4xx raises ``HAResponseError``.
+        """
+        try:
+            await self.api_call("DELETE", f"/api/states/{entity_id}")
+        except HAResponseError as e:
+            if e.status == 404:
+                return False
+            raise
+        except RuntimeError:
+            return None
+        return True
+
     async def get_last_updated(
         self,
         entity_id: str,

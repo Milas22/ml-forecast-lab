@@ -1216,6 +1216,16 @@ class MLForecastLabApp:
         self._ha_states_seen: Optional[bool] = None
         self._next_states_check: Optional[datetime] = None
         self._states_check_running = False
+        # v2.52.7: every entity id the app has posted, with its experiment,
+        # mirrored to _published_entities_path (set by run(); None in tests)
+        # so sensors of renamed, removed or lab experiments can be removed.
+        self._published_entities: Dict[str, str] = {}
+        self._published_entities_path: Optional[Path] = None
+        self._orphan_candidates: set = set()
+        self._orphan_cleanup_disabled = False
+        # v2.52.7: True while self.config is the stub used when no config
+        # file was found — never a basis for removing sensors.
+        self._config_is_stub = False
         self.last_update = None
         self.benchmarks_to_run = set()
         # Cached trained models for fast forecast cycles
@@ -1345,6 +1355,7 @@ class MLForecastLabApp:
             )
             logger.info("Creating stub configuration...")
             self.config = self._create_stub_config()
+            self._config_is_stub = True
         else:
             try:
                 from ml_forecast_lab.config import load_config
@@ -1374,6 +1385,7 @@ class MLForecastLabApp:
                 self._last_config_path = found_path
                 self._last_config_mtime = current_mtime
                 self.config = new_config
+                self._config_is_stub = False
             except Exception as e:
                 if self.config is not None:
                     # Periodic reload failed — keep the existing good config
@@ -1576,11 +1588,22 @@ class MLForecastLabApp:
                             exp_cfg = cfg
                             break
                     if exp_cfg:
+                        started_at = datetime.now(timezone.utc)
                         try:
                             self.web_app.state.appstate.start_benchmark(experiment_name)
                             await self._run_benchmark(exp_cfg)
                         except Exception as e:
                             logger.error(f"Benchmark failed: {e}", exc_info=True)
+                            # v2.52.7: the Training-tab benchmark never posted
+                            # _last_benchmark; only the lab-mode cycle did.
+                            await self._publish_lifecycle_sensor(
+                                exp_cfg, "benchmark", "failed",
+                                {"error": str(e)[:200]},
+                            )
+                        else:
+                            await self._publish_benchmark_completed(
+                                exp_cfg, started_at,
+                            )
                         finally:
                             self.web_app.state.appstate.end_benchmark(experiment_name)
                             self._running_tasks.pop(experiment_name, None)
@@ -1877,15 +1900,7 @@ class MLForecastLabApp:
 
             # Publish lifecycle sensor for HA automations
             if is_lab_mode:
-                _duration = (datetime.now(timezone.utc) - _started_at).total_seconds()
-                _attrs = {"duration_seconds": round(_duration, 1)}
-                br = (self.web_app.state.appstate.benchmark_results.get(experiment_name)
-                      if self.web_app else None)
-                if br and getattr(br, "best_model_name", None):
-                    _attrs["winner"] = br.best_model_name
-                await self._publish_lifecycle_sensor(
-                    exp_cfg, "benchmark", "completed", _attrs,
-                )
+                await self._publish_benchmark_completed(exp_cfg, _started_at)
 
         except Exception as e:
             logger.error(
@@ -5728,7 +5743,7 @@ class MLForecastLabApp:
             if outcome == "ok":
                 self._forecast_failures.pop(exp_cfg.name, None)
                 await self.publish_heartbeat()
-                await self._restore_lifecycle_sensor(exp_cfg)
+                await self._restore_lifecycle_sensors(exp_cfg)
             elif outcome in ("no_frame", "publish_failed"):
                 # v2.52.7: HA unreachable for the fetch or the posts.
                 self._schedule_forecast_retry(exp_cfg)
@@ -5779,48 +5794,184 @@ class MLForecastLabApp:
             self._forecast_failures, timedelta(minutes=fc_mins),
         )
 
-    async def _restore_lifecycle_sensor(self, exp_cfg) -> None:
-        """v2.52.7: post the experiment's ``_last_retrain`` sensor if HA
-        lacks it.
+    async def _restore_lifecycle_sensors(self, exp_cfg) -> None:
+        """v2.52.7: post the experiment's ``_last_retrain`` and
+        ``_last_benchmark`` sensors if HA lacks them.
 
-        HA does not restore REST-posted states, so after a restart the
-        sensor would stay missing until the next retrain. Checked once per
-        experiment after its first forecast since the app started or since
-        HA last lost the app's states. Re-posts this process's last payload
-        unchanged, else the cached model's ``trained_at`` — never "now",
-        which would fire automations on a retrain that didn't happen.
+        HA does not restore REST-posted states, so after a restart they
+        would stay missing until the next retrain or benchmark. Checked
+        once per experiment after its first forecast since the app started
+        or since HA last lost the app's states (again after the next
+        forecast if HA didn't answer).
         """
         if exp_cfg.name in self._lifecycle_checked or not self.ha_interface:
             return
         try:
-            publish_name = exp_cfg.publish_name or exp_cfg.name
-            prefix = exp_cfg.publish_prefix or "mlfl_"
-            entity_id = f"sensor.{prefix}{publish_name}_last_retrain"
-            exists = await self.ha_interface.entity_exists(entity_id)
-            if exists is None:
-                return  # unreachable: check again after the next forecast
-            self._lifecycle_checked.add(exp_cfg.name)
-            if exists:
-                return
-            stored = self._lifecycle_payloads.get(entity_id)
-            if stored:
-                state, attrs, _ = stored
-                await self.ha_interface.set_state(entity_id, state, attrs)
-                return
-            cache = self._cached_models.get(exp_cfg.name) or {}
-            trained_at = cache.get("trained_at")
-            if trained_at is None:
-                return
-            await self._publish_lifecycle_sensor(
-                exp_cfg, "retrain", "completed",
-                {
-                    "model": cache.get("model_name"),
-                    "model_version": cache.get("model_version"),
-                },
-                at=trained_at,
-            )
+            answered = [
+                await self._restore_lifecycle_sensor(exp_cfg, event)
+                for event in ("retrain", "benchmark")
+            ]
+            if all(answered):
+                self._lifecycle_checked.add(exp_cfg.name)
         except Exception as e:
-            logger.debug(f"  _last_retrain restore for {exp_cfg.name} failed: {e}")
+            logger.debug(f"  Lifecycle sensor restore for {exp_cfg.name} failed: {e}")
+
+    async def _restore_lifecycle_sensor(self, exp_cfg, event: str) -> bool:
+        """Post ``_last_<event>`` if HA lacks it; False if HA didn't answer.
+
+        Re-posts this process's last payload unchanged, else rebuilds it
+        from the cached model's ``trained_at`` (retrain) or the saved
+        benchmark result's timestamp (benchmark) — never "now", which would
+        fire automations for an event that didn't happen.
+        """
+        publish_name = exp_cfg.publish_name or exp_cfg.name
+        prefix = exp_cfg.publish_prefix or "mlfl_"
+        entity_id = f"sensor.{prefix}{publish_name}_last_{event}"
+        exists = await self.ha_interface.entity_exists(entity_id)
+        if exists is None:
+            return False
+        if exists:
+            return True
+        stored = self._lifecycle_payloads.get(entity_id)
+        if stored:
+            state, attrs, _ = stored
+            await self.ha_interface.set_state(entity_id, state, attrs)
+            return True
+        if event == "retrain":
+            cache = self._cached_models.get(exp_cfg.name) or {}
+            if cache.get("trained_at") is not None:
+                await self._publish_lifecycle_sensor(
+                    exp_cfg, "retrain", "completed",
+                    {
+                        "model": cache.get("model_name"),
+                        "model_version": cache.get("model_version"),
+                    },
+                    at=cache["trained_at"],
+                )
+            return True
+        br = (self.web_app.state.appstate.benchmark_results.get(exp_cfg.name)
+              if self.web_app else None)
+        ts = getattr(br, "timestamp", None)
+        if br is None or not ts or getattr(br, "status", "") not in ("completed", "failed"):
+            return True
+        attrs = {}
+        if getattr(br, "best_model_name", None):
+            attrs["winner"] = br.best_model_name
+        try:
+            at = datetime.fromisoformat(ts)
+        except ValueError:
+            return True
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        await self._publish_lifecycle_sensor(exp_cfg, "benchmark", br.status, attrs, at=at)
+        return True
+
+    def _expected_entities(self, exp_cfg) -> set:
+        """Every entity id a production experiment posts under its current
+        config (forecast family, bands at its ``conformal_coverage`` level,
+        ``_interval`` for cumulative sources, lifecycle sensors)."""
+        publish_name = exp_cfg.publish_name or exp_cfg.name
+        base = f"sensor.{exp_cfg.publish_prefix}{publish_name}"
+        life = f"sensor.{exp_cfg.publish_prefix or 'mlfl_'}{publish_name}"
+        pct = int(round(float(getattr(exp_cfg, "conformal_coverage", 0.8)) * 100))
+        ids = {
+            f"{base}_forecast", f"{base}_cumulative", f"{base}_upper_{pct}",
+            f"{base}_lower_{pct}", f"{base}_forecast_accuracy",
+            f"{life}_last_retrain", f"{life}_last_benchmark",
+        }
+        if exp_cfg.source_is_cumulative:
+            ids.add(f"{base}_interval")
+        return ids
+
+    def _record_published(self, exp_name: str, entity_ids: list) -> None:
+        """Remember which experiment posted each id; persisted on change."""
+        changed = False
+        for eid in entity_ids:
+            if self._published_entities.get(eid) != exp_name:
+                self._published_entities[eid] = exp_name
+                changed = True
+        if changed:
+            self._persist_published_entities()
+
+    def _persist_published_entities(self) -> None:
+        import json
+        path = self._published_entities_path
+        if path is None:
+            return
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                self._published_entities, indent=2, sort_keys=True,
+            ))
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"  Could not save published sensor list to {path}: {e}")
+
+    def _restore_published_entities(self) -> None:
+        """v2.52.7: reload the ids a previous run posted."""
+        import json
+        path = self._published_entities_path
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except Exception as e:
+            logger.warning(f"  Could not read published sensor list from {path}: {e}")
+            return
+        if isinstance(data, dict):
+            self._published_entities.update({
+                k: v for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, str)
+            })
+
+    async def _retire_orphaned_sensors(self) -> None:
+        """v2.52.7: remove sensors the app posted but no longer produces.
+
+        A renamed ``publish_name``/``publish_prefix``, a changed
+        ``conformal_coverage``, an experiment switched to lab or removed:
+        the old ids used to keep their last value until HA restarted. An id
+        is removed once it has been unexpected in two consecutive checks,
+        so a config reload caught mid-write can't remove live sensors; never
+        while the config is the no-file stub or lists no experiments. Only
+        ids this app recorded posting are touched.
+        """
+        if (self._orphan_cleanup_disabled or self._config_is_stub
+                or not self._published_entities
+                or not self.config or not self.config.experiments):
+            return
+        from ml_forecast_lab.ha_interface import HAResponseError
+        expected = set()
+        for e in self.config.experiments:
+            if e.mode == "production":
+                expected |= self._expected_entities(e)
+        candidates = {eid for eid in self._published_entities if eid not in expected}
+        due = candidates & self._orphan_candidates
+        self._orphan_candidates = candidates - due
+        removed = []
+        for eid in sorted(due):
+            try:
+                result = await self.ha_interface.delete_state(eid)
+            except HAResponseError as e:
+                logger.warning(
+                    f"Home Assistant refused to remove {eid} ({e}); "
+                    f"leaving sensors the app no longer posts in place"
+                )
+                self._orphan_cleanup_disabled = True
+                return
+            if result is None:
+                self._orphan_candidates.add(eid)  # unreachable: next check
+                continue
+            self._published_entities.pop(eid, None)
+            self._lifecycle_payloads.pop(eid, None)
+            if result:
+                removed.append(eid)
+        if due:
+            self._persist_published_entities()
+        if removed:
+            logger.info(
+                f"Removed {len(removed)} sensor(s) the app no longer posts: "
+                f"{', '.join(removed)}"
+            )
 
     async def _check_ha_states(self) -> None:
         """v2.52.7: re-post the app's sensors when HA has lost them.
@@ -5839,6 +5990,7 @@ class MLForecastLabApp:
             exists = await self.ha_interface.entity_exists(HEARTBEAT_ENTITY)
             if exists is None:
                 return
+            await self._retire_orphaned_sensors()
             if exists:
                 self._ha_states_seen = True
                 return
@@ -5851,14 +6003,19 @@ class MLForecastLabApp:
                 if e.mode == "production"
                 and not self._forecast_running.get(e.name, False)
             }
+            expected = {
+                e.name: self._expected_entities(e)
+                for e in self.config.experiments if e.name in names
+            }
             payloads = [
                 p for name in sorted(names)
                 for p in self._last_payloads.get(name, [])
+                if p[0] in expected[name]
             ]
             payloads += [
                 (eid, state, attrs)
                 for eid, (state, attrs, name) in self._lifecycle_payloads.items()
-                if name in names
+                if name in names and eid in expected[name]
             ]
             if not payloads:
                 return
@@ -6470,17 +6627,8 @@ class MLForecastLabApp:
                 entry = _cache_entry_from_meta(meta, model, exp_cfg)
                 trained_at = entry["trained_at"]
                 self._cached_models[exp_cfg.name] = entry
-                # Also mirror into web status so the UI reflects the
-                # restored champion immediately, not "unknown" until the
-                # next retrain writes one.
-                if self.web_app:
-                    status = self.web_app.state.appstate.experiment_statuses.get(
-                        exp_cfg.name
-                    )
-                    if status:
-                        status.best_model = model_name
-                        status.model_version = meta["model_version"]
-                        status.last_benchmark_timestamp = meta["trained_at"]
+                # The dashboard is updated by _sync_restored_models_to_ui
+                # once the web app exists (it doesn't yet at this point).
                 age_m = (datetime.now(timezone.utc) - trained_at).total_seconds() / 60
                 logger.info(
                     f"  Restored cached {model_name} for {exp_cfg.name} "
@@ -6499,6 +6647,32 @@ class MLForecastLabApp:
                 f"Restored {restored} cached production model(s) from disk — "
                 f"skipping immediate retrain for these experiments"
             )
+
+    def _sync_restored_models_to_ui(self) -> None:
+        """v2.52.7: show restored production models on the dashboard.
+
+        ``_restore_cached_models`` runs before the web app exists, so its
+        old status mirror never ran: an experiment with a restored model
+        but no saved benchmark result showed "Pending" and no model while
+        it forecast normally. Fills only what the saved benchmark left
+        unset; the deployed ``model_version`` always comes from the model.
+        """
+        if not self.web_app:
+            return
+        statuses = self.web_app.state.appstate.experiment_statuses
+        for name, entry in self._cached_models.items():
+            st = statuses.get(name)
+            if st is None:
+                continue
+            if entry.get("model_version"):
+                st.model_version = entry["model_version"]
+            if not st.best_model:
+                st.best_model = entry.get("model_name")
+            if st.last_benchmark_status == "pending":
+                st.last_benchmark_status = "completed"
+                trained_at = entry.get("trained_at")
+                if trained_at is not None and not st.last_benchmark_timestamp:
+                    st.last_benchmark_timestamp = trained_at.isoformat()
 
     def _rollback_cached_model(self, exp_name: str) -> tuple[bool, Optional[str]]:
         """Roll a regressive retrain back to the previous champion.
@@ -7486,6 +7660,7 @@ class MLForecastLabApp:
         ])
         # v2.52.7: kept for _check_ha_states to re-post after an HA restart.
         self._last_payloads[exp_cfg.name] = payloads
+        self._record_published(exp_cfg.name, [eid for eid, _, _ in payloads])
 
         succeeded = [eid for eid, ok, _ in results if ok]
         failed = [(eid, err) for eid, ok, err in results if not ok]
@@ -9699,9 +9874,16 @@ class MLForecastLabApp:
                 "/data/ml_forecast_lab/source_units.json"
             )
             self._restore_source_units()
+            # v2.52.7: and which sensors it posted, so ones it no longer
+            # produces can be removed.
+            self._published_entities_path = Path(
+                "/data/ml_forecast_lab/published_entities.json"
+            )
+            self._restore_published_entities()
 
             # Start web server
             await self.start_web_server()
+            self._sync_restored_models_to_ui()
 
             # Run main event loop
             await self.main_loop()
@@ -9710,6 +9892,17 @@ class MLForecastLabApp:
             logger.info("Received keyboard interrupt")
         finally:
             await self.shutdown()
+
+    async def _publish_benchmark_completed(self, exp_cfg, started_at: datetime) -> None:
+        """Post ``_last_benchmark`` for a completed benchmark, with its
+        duration and winner."""
+        duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+        attrs = {"duration_seconds": round(duration, 1)}
+        br = (self.web_app.state.appstate.benchmark_results.get(exp_cfg.name)
+              if self.web_app else None)
+        if br and getattr(br, "best_model_name", None):
+            attrs["winner"] = br.best_model_name
+        await self._publish_lifecycle_sensor(exp_cfg, "benchmark", "completed", attrs)
 
     async def _publish_lifecycle_sensor(
         self,
@@ -9756,6 +9949,7 @@ class MLForecastLabApp:
             self._lifecycle_payloads[entity_id] = (
                 now_iso, payload_attrs, exp_cfg.name,
             )
+            self._record_published(exp_cfg.name, [entity_id])
             await self.ha_interface.set_state(entity_id, now_iso, payload_attrs)
         except Exception as e:
             # Lifecycle publish is best-effort. A failure here must not

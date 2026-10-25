@@ -114,6 +114,19 @@ class TestHAErrors:
         assert sess.calls == 1
 
     @pytest.mark.parametrize("answer, expected", [
+        (200, True), (404, False), (502, None),
+        (aiohttp.ClientConnectionError("refused"), None),
+    ])
+    def test_delete_state(self, monkeypatch, answer, expected):
+        iface, _ = _iface([answer] * 3, monkeypatch)
+        assert asyncio.run(iface.delete_state("sensor.x")) is expected
+
+    def test_delete_state_raises_on_other_4xx(self, monkeypatch):
+        iface, _ = _iface([405], monkeypatch)
+        with pytest.raises(HAResponseError):
+            asyncio.run(iface.delete_state("sensor.x"))
+
+    @pytest.mark.parametrize("answer, expected", [
         (200, True), (404, False), (401, None), (502, None),
         (aiohttp.ClientConnectionError("refused"), None),
     ])
@@ -141,6 +154,15 @@ class _StubHA:
         self.captured: list = []
         self.fail_posts = False
         self.exists: dict = {}  # entity_id -> True / False / None
+        self.deleted: list = []
+        self.delete_result = True  # or None (unreachable) / an exception
+
+    async def delete_state(self, entity_id):
+        if isinstance(self.delete_result, BaseException):
+            raise self.delete_result
+        if self.delete_result is not None:
+            self.deleted.append(entity_id)
+        return self.delete_result
 
     async def set_state(self, entity_id, state, attributes=None):
         if self.fail_posts:
@@ -300,7 +322,7 @@ class TestForecastRetry:
 
         app._forecast_with_cached = forecast
         app.publish_heartbeat = heartbeat
-        app._restore_lifecycle_sensor = lifecycle
+        app._restore_lifecycle_sensors = lifecycle
         return app, exp, far, calls
 
     @pytest.mark.parametrize("outcome", ["no_frame", "publish_failed", HAUnavailableError("down")])
@@ -461,7 +483,7 @@ class TestRepostAfterHARestart:
         assert "sensor.mlfl_solar_forecast" not in app.ha_interface.posted()
 
 
-# --- _last_retrain restore -----------------------------------------------
+# --- _last_retrain / _last_benchmark restore ------------------------------
 
 class TestLastRetrainRestore:
     LAST = "sensor.mlfl_solar_last_retrain"
@@ -478,32 +500,255 @@ class TestLastRetrainRestore:
 
     def test_missing_sensor_restored_from_the_cached_model(self):
         app, exp, trained = self._app(False)
-        asyncio.run(app._restore_lifecycle_sensor(exp))
+        asyncio.run(app._restore_lifecycle_sensors(exp))
         state, attrs = app.ha_interface.posted()[self.LAST]
         assert state == trained.isoformat()
         assert attrs["model"] == "lightgbm" and attrs["model_version"] == "v7"
         assert attrs["outcome"] == "completed"
         app.ha_interface.captured = []
-        asyncio.run(app._restore_lifecycle_sensor(exp))
+        asyncio.run(app._restore_lifecycle_sensors(exp))
         assert app.ha_interface.captured == []
 
     def test_present_sensor_left_alone(self):
         app, exp, _ = self._app(True)
-        asyncio.run(app._restore_lifecycle_sensor(exp))
+        asyncio.run(app._restore_lifecycle_sensors(exp))
         assert app.ha_interface.captured == []
         assert "solar" in app._lifecycle_checked
 
     def test_unreachable_ha_checks_again_next_time(self):
         app, exp, _ = self._app(None)
-        asyncio.run(app._restore_lifecycle_sensor(exp))
+        asyncio.run(app._restore_lifecycle_sensors(exp))
         assert app.ha_interface.captured == []
         assert "solar" not in app._lifecycle_checked
 
     def test_this_processs_payload_reposted_unchanged(self):
         app, exp, _ = self._app(False)
         app._lifecycle_payloads[self.LAST] = ("2026-10-25T03:00:07+00:00", {"x": 1}, "solar")
-        asyncio.run(app._restore_lifecycle_sensor(exp))
+        asyncio.run(app._restore_lifecycle_sensors(exp))
         assert app.ha_interface.posted()[self.LAST] == ("2026-10-25T03:00:07+00:00", {"x": 1})
+
+
+class TestLastBenchmarkRestore:
+    LAST = "sensor.mlfl_solar_last_benchmark"
+
+    def _app(self, br):
+        exp = _exp()
+        app = _make_app(exp)
+        app.ha_interface.exists[self.LAST] = False
+        app.web_app = types.SimpleNamespace(state=types.SimpleNamespace(
+            appstate=types.SimpleNamespace(
+                benchmark_results={"solar": br} if br else {},
+                experiment_statuses={},
+            )))
+        return app, exp
+
+    def test_rebuilt_from_the_saved_benchmark_result(self):
+        br = types.SimpleNamespace(
+            timestamp="2026-10-20T09:15:00+00:00", status="completed",
+            best_model_name="nhits",
+        )
+        app, exp = self._app(br)
+        asyncio.run(app._restore_lifecycle_sensors(exp))
+        state, attrs = app.ha_interface.posted()[self.LAST]
+        assert state == "2026-10-20T09:15:00+00:00"
+        assert attrs["outcome"] == "completed" and attrs["winner"] == "nhits"
+
+    def test_no_saved_result_posts_nothing(self):
+        app, exp = self._app(None)
+        asyncio.run(app._restore_lifecycle_sensors(exp))
+        assert self.LAST not in app.ha_interface.posted()
+        assert "solar" in app._lifecycle_checked
+
+    def test_running_benchmark_is_not_restored(self):
+        br = types.SimpleNamespace(timestamp="2026-10-20T09:15:00+00:00",
+                                   status="running", best_model_name=None)
+        app, exp = self._app(br)
+        asyncio.run(app._restore_lifecycle_sensors(exp))
+        assert self.LAST not in app.ha_interface.posted()
+
+
+class TestTrainingTabBenchmarkSensor:
+    def test_completed_benchmark_posts_last_benchmark(self):
+        exp = _exp()
+        app = _make_app(exp)
+        app.web_app = types.SimpleNamespace(state=types.SimpleNamespace(
+            appstate=types.SimpleNamespace(benchmark_results={
+                "solar": types.SimpleNamespace(best_model_name="nhits"),
+            })))
+        started = datetime.now(timezone.utc) - timedelta(seconds=90)
+        asyncio.run(app._publish_benchmark_completed(exp, started))
+        state, attrs = app.ha_interface.posted()["sensor.mlfl_solar_last_benchmark"]
+        assert attrs["outcome"] == "completed" and attrs["winner"] == "nhits"
+        assert attrs["duration_seconds"] == pytest.approx(90, abs=2)
+
+    def test_benchmark_trigger_posts_on_completion_and_failure(self):
+        src = inspect.getsource(MLForecastLabApp.start_web_server)
+        trigger = src[src.index("async def _benchmark_trigger"):src.index("benchmark_callback = _benchmark_trigger")]
+        assert "self._publish_benchmark_completed(" in trigger
+        assert '"benchmark", "failed"' in trigger
+
+
+# --- dashboard card after a restart --------------------------------------
+
+def _status(**kw):
+    base = dict(best_model=None, model_version=None,
+                last_benchmark_status="pending", last_benchmark_timestamp=None)
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+class TestRestoredModelsOnTheDashboard:
+    def _app(self, st):
+        app = _make_app(_exp())
+        self.trained = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+        app._cached_models["solar"] = {
+            "model_name": "lightgbm", "model_version": "v7", "trained_at": self.trained,
+        }
+        app.web_app = types.SimpleNamespace(state=types.SimpleNamespace(
+            appstate=types.SimpleNamespace(experiment_statuses={"solar": st})))
+        return app
+
+    def test_pending_card_shows_the_restored_model(self):
+        st = _status()
+        self._app(st)._sync_restored_models_to_ui()
+        assert st.best_model == "lightgbm" and st.model_version == "v7"
+        assert st.last_benchmark_status == "completed"
+        assert st.last_benchmark_timestamp == self.trained.isoformat()
+
+    def test_saved_benchmark_values_are_kept(self):
+        st = _status(best_model="nhits", last_benchmark_status="failed",
+                     last_benchmark_timestamp="2026-10-20T09:15:00+00:00")
+        self._app(st)._sync_restored_models_to_ui()
+        assert st.best_model == "nhits"
+        assert st.last_benchmark_status == "failed"
+        assert st.last_benchmark_timestamp == "2026-10-20T09:15:00+00:00"
+        assert st.model_version == "v7"
+
+    def test_run_syncs_after_the_web_app_starts(self):
+        src = inspect.getsource(MLForecastLabApp.run)
+        assert src.index("await self.start_web_server()") < src.index(
+            "self._sync_restored_models_to_ui()") < src.index("await self.main_loop()")
+
+
+# --- sensors the app no longer posts --------------------------------------
+
+class TestOrphanedSensors:
+    def _app(self, tmp_path=None, **kw):
+        exp = _exp(**kw)
+        app = _make_app(exp)
+        if tmp_path is not None:
+            app._published_entities_path = tmp_path / "published_entities.json"
+        _publish(app, exp)
+        asyncio.run(app._publish_lifecycle_sensor(exp, "retrain", "completed"))
+        return app, exp
+
+    def _check(self, app):
+        asyncio.run(app._retire_orphaned_sensors())
+
+    def test_posted_ids_are_recorded_and_persisted(self, tmp_path):
+        import json
+        app, _ = self._app(tmp_path)
+        recorded = json.loads((tmp_path / "published_entities.json").read_text())
+        assert recorded["sensor.mlfl_solar_forecast"] == "solar"
+        assert recorded["sensor.mlfl_solar_last_retrain"] == "solar"
+        app2 = _make_app(_exp())
+        app2._published_entities_path = tmp_path / "published_entities.json"
+        app2._restore_published_entities()
+        assert app2._published_entities == recorded
+
+    def test_renamed_sensors_removed_on_the_second_check(self, caplog):
+        app, exp = self._app()
+        app.config.experiments = [_exp(publish_name="pv")]
+        self._check(app)
+        assert app.ha_interface.deleted == []
+        with caplog.at_level(logging.INFO, logger="ml_forecast_lab.main"):
+            self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.deleted
+        assert "sensor.mlfl_solar_last_retrain" in app.ha_interface.deleted
+        assert not any(e.startswith("sensor.mlfl_pv") for e in app.ha_interface.deleted)
+        assert not any(k.startswith("sensor.mlfl_solar") for k in app._published_entities)
+        assert "sensor(s) the app no longer posts" in caplog.text
+
+    def test_lab_experiment_sensors_removed(self):
+        app, _ = self._app()
+        app.config.experiments = [_exp(mode="lab"), _exp("other")]
+        self._check(app)
+        self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.deleted
+
+    def test_changed_coverage_removes_only_the_old_bands(self):
+        app, _ = self._app()
+        app.config.experiments = [_exp(conformal_coverage=0.9)]
+        self._check(app)
+        self._check(app)
+        assert set(app.ha_interface.deleted) == {
+            "sensor.mlfl_solar_upper_80", "sensor.mlfl_solar_lower_80",
+        }
+
+    def test_ids_reused_by_another_experiment_are_kept(self):
+        app, _ = self._app()
+        app.config.experiments = [_exp("renamed", publish_name="solar")]
+        self._check(app)
+        self._check(app)
+        assert app.ha_interface.deleted == []
+
+    def test_unexpected_in_one_check_only_is_kept(self):
+        app, exp = self._app()
+        app.config.experiments = [_exp(publish_name="pv")]
+        self._check(app)
+        app.config.experiments = [exp]
+        self._check(app)
+        self._check(app)
+        assert app.ha_interface.deleted == []
+
+    @pytest.mark.parametrize("setup", ["stub", "empty"])
+    def test_no_cleanup_without_a_real_config(self, setup):
+        app, _ = self._app()
+        if setup == "stub":
+            app._config_is_stub = True
+            app.config.experiments = [_exp("example")]
+        else:
+            app.config.experiments = []
+        self._check(app)
+        self._check(app)
+        assert app.ha_interface.deleted == []
+
+    def test_unreachable_ha_retries_later(self):
+        app, _ = self._app()
+        app.config.experiments = [_exp(publish_name="pv")]
+        app.ha_interface.delete_result = None
+        self._check(app)
+        self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app._published_entities
+        app.ha_interface.delete_result = True
+        self._check(app)
+        assert "sensor.mlfl_solar_forecast" in app.ha_interface.deleted
+
+    def test_refused_delete_disables_cleanup(self, caplog):
+        app, _ = self._app()
+        app.config.experiments = [_exp(publish_name="pv")]
+        app.ha_interface.delete_result = HAResponseError(405, "HA API error 405: no")
+        self._check(app)
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            self._check(app)
+        assert app._orphan_cleanup_disabled
+        assert "refused to remove" in caplog.text
+
+    def test_repost_skips_ids_the_experiment_no_longer_posts(self):
+        app, _ = self._app()
+        app.config.experiments = [_exp(conformal_coverage=0.9)]
+        app._ha_states_seen = True
+        app.ha_interface.exists[HEARTBEAT_ENTITY] = False
+        app.ha_interface.delete_result = None
+        app.ha_interface.captured = []
+        asyncio.run(app._check_ha_states())
+        posted = app.ha_interface.posted()
+        assert "sensor.mlfl_solar_forecast" in posted
+        assert "sensor.mlfl_solar_upper_80" not in posted
+
+    def test_run_restores_the_record_before_main_loop(self):
+        src = inspect.getsource(MLForecastLabApp.run)
+        assert src.index("self._restore_published_entities()") < src.index("await self.main_loop()")
 
 
 # --- wiring --------------------------------------------------------------

@@ -21,7 +21,9 @@ python -m pytest tests/unit/test_restart_availability.py -v
 | **B.** `startup: services` started the app before Core; the Supervisor proxy answers 502 until Core is `RUNNING` | An experiment with no usable saved model retrained at once, failed on the 502, and was not retried for `retrain_every_hours`: no forecasts for up to a day | `startup: application`; an `HAUnavailableError` retrain or forecast failure retries after `HA_RETRY_MINUTES` (2, 5, 15, 60, capped at the cadence) |
 | **C.** A retrain replacing a pinned `production_model` deleted the old cache entry first | A failed replacement left the experiment with nothing to forecast with | The old entry is restored if the retrain fails |
 | **D.** `_cumulative` (signed predictions) and the bands (before calibration) were omitted | HA showed their last value until a restart removed them; a PV model that dips below zero at night rarely has an unsigned 24 h horizon, so `_cumulative` stayed missing | Posted as `unknown` with a `status` attribute (`signed_predictions`, `no_conformal_bands`); bands under the configured `conformal_coverage` level's ids |
-| **E.** `_last_retrain` and `sensor.mlfl_last_run` were only posted by a retrain | Both missing for up to `retrain_every_hours` after any HA restart | The heartbeat is posted with every successful forecast; `_restore_lifecycle_sensor` re-posts `_last_retrain` when HA lacks it |
+| **E.** `_last_retrain` and `sensor.mlfl_last_run` were only posted by a retrain; `_last_benchmark` only by the lab-mode cycle, never by a Training-tab benchmark | Missing for up to `retrain_every_hours` after any HA restart; `_last_benchmark` of a production experiment never came back | The heartbeat is posted with every successful forecast; the Training-tab benchmark posts `_last_benchmark`; `_restore_lifecycle_sensors` re-posts both lifecycle sensors when HA lacks them |
+| **F.** Nothing retired an entity id the app stopped producing (experiment renamed, switched to lab or removed; `publish_name`/`publish_prefix` or `conformal_coverage` changed) | The old sensors kept their last values until an HA restart dropped them | `_retire_orphaned_sensors` deletes recorded ids no current production experiment produces |
+| **G.** `_restore_cached_models` mirrored restored models into the dashboard status before the web app existed, so the mirror never ran | A production experiment with a restored model but no saved benchmark result showed "Pending" and no model | `_sync_restored_models_to_ui` runs after `start_web_server` and fills only what the saved benchmark left unset |
 
 ## Mechanisms
 
@@ -102,6 +104,28 @@ has the sensor.
 - Never "now", and never over a sensor HA still has: a changed timestamp would
   fire automations for a retrain that did not happen.
 
+**Retiring orphaned sensors.** `_record_published` maps every id the app
+posts (forecast family and lifecycle) to its experiment and mirrors it to
+`/data/ml_forecast_lab/published_entities.json`. Each minute's
+`_check_ha_states` (when HA answers) calls `_retire_orphaned_sensors`.
+- The expected set is computed from the config, not from the last payloads:
+  `_expected_entities` gives the forecast family, the bands at
+  `conformal_coverage`, `_interval` for cumulative sources, and the lifecycle
+  ids. So an id that a renamed experiment still produces under the same
+  `publish_name` is never touched, even before that experiment's first
+  forecast.
+- An id is deleted (`DELETE /api/states/<id>`) only after it has been
+  unexpected in two consecutive checks. A config reload caught mid-write, or
+  the stub config used when no file is found (`_config_is_stub`), therefore
+  can't remove live sensors; nothing runs while the config lists no
+  experiments.
+- Only ids this app recorded are candidates, so ids posted before v2.52.7 are
+  left alone; HA drops those at its next restart anyway.
+- A 404 still clears the record. An unreachable HA keeps the id for the next
+  check. Any other refusal disables the cleanup with one warning.
+- The re-post after an HA restart is filtered to the expected set, so it
+  can't resurrect a retired id.
+
 **`unknown` instead of omitted.** `unknown` is non-numeric, so HA's statistics
 ignore it and no unit repair fires. A dashboard shows "Unknown" with a reason
 instead of "Entity not available". `_interval` stays omitted for
@@ -109,16 +133,11 @@ non-cumulative sources: it would only duplicate `_forecast`.
 
 ## Limits that remain
 
-- `_last_benchmark` of a production experiment is only posted by the lab
-  benchmark path, so an HA restart still removes it until the next benchmark.
-- Entity ids the app no longer produces (an experiment switched to lab,
-  renamed, or given a new `conformal_coverage`) are never retired. They
-  disappear for good at the next HA restart.
+- A rebuilt `_last_benchmark` is only possible from the saved benchmark
+  result. One discarded at start (none of its models still enabled) leaves the
+  sensor missing until the next benchmark.
 - **Not availability, found in the same review.** A covariate column absent at
   forecast time reaches the tree path as 0.0 with its pinned `_missing`
   indicator zero-filled (`preprocessing.py` `resolve_missingness`,
   `row_dict.get(c, 0.0)`), contrary to the masking invariant. It changes what
   a model is fed, so its fix is a separate minor release.
-- After a restart, a production experiment with no saved benchmark result
-  shows "Pending" on its card: `_restore_cached_models` runs before the web app
-  exists, so the UI mirror never runs.

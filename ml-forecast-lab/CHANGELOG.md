@@ -13,7 +13,7 @@
   two minutes.
 - If Home Assistant restarts, the app puts its sensors back within about a
   minute, and retries within minutes when Home Assistant isn't ready.
-- The last-retrain and last-run sensors now come back with the forecasts.
+- The last-retrain, last-benchmark and last-run sensors now come back too.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
 
 **The cumulative and band sensors no longer disappear.**
@@ -25,6 +25,23 @@
 - For forecasts that can't go below zero, such as solar power, set
   `target_is_nonnegative: true` so the cumulative sensor gets a value.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**Sensors from renamed or lab experiments are removed.**
+
+- After renaming an experiment's sensors, changing its band coverage or
+  switching it to lab, the old sensors kept their last values until Home
+  Assistant restarted.
+- The app now removes sensors it no longer updates within about two minutes.
+- It only removes sensors it created itself, from this version on.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**The dashboard and the last-benchmark sensor stay accurate.**
+
+- Benchmarks run from the Training tab now update the last-benchmark
+  sensor; before, only scheduled lab benchmarks did.
+- After a restart, an experiment with a trained model but no saved
+  benchmark showed "Pending" and no model on its dashboard card; it now
+  shows its model.
 
 ## 2.52.6
 

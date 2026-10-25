@@ -375,11 +375,13 @@ When an experiment is in `mode: production`, the app publishes the following sen
 | `sensor.mlfl_<name>_upper_<pct>` | Upper conformal band at the `<pct>` coverage level (default `80`). | Renamed to match `conformal_coverage` — e.g. `_upper_90` if you set `0.9`. Shows `unknown` with `status: no_conformal_bands` until enough residuals have been calibrated; cold-start may take ~10 forecast cycles. |
 | `sensor.mlfl_<name>_lower_<pct>` | Lower conformal band. | As above. |
 | `sensor.mlfl_<name>_forecast_accuracy` | Mean absolute error of the next-interval forecast over the last 30 days. Per interval when `source_is_cumulative` is true. | Recomputed on every forecast publish. Attributes carry the full lead-time curve (`lead_hours`, `mae`, `rmse`, `sample_count`) and the first-versus-latest revision MAE. `status` reads `accumulating` until a next-interval forecast has been scored. |
-| `sensor.mlfl_<name>_last_benchmark` | ISO timestamp of the most recent benchmark completion. | `device_class: timestamp`. Attributes include outcome, duration, winner, and a truncated error string when the cycle failed — convenient triggers for HA automations. |
+| `sensor.mlfl_<name>_last_benchmark` | ISO timestamp of the most recent benchmark completion. | `device_class: timestamp`. Updated by every benchmark, including one started from the Training tab. Attributes include outcome, duration, winner, and a truncated error string when the cycle failed — convenient triggers for HA automations. |
 | `sensor.mlfl_<name>_last_retrain` | ISO timestamp of the most recent retrain. | Same shape as `_last_benchmark`. |
 | `sensor.mlfl_last_run` | ISO timestamp of the app's most recent successful forecast or retrain, across all experiments. | A heartbeat: if it stops advancing, the app has stopped forecasting. |
 
 Home Assistant does not keep these sensors across its own restart. The app checks for them every minute and puts them back with the last forecast's values, then refreshes them at the next forecast. After the app itself starts, each experiment with a trained model forecasts within two minutes; an experiment still training appears when its retrain finishes.
+
+Sensors exist only while their experiment is in production. When you rename an experiment or its `publish_name`/`publish_prefix`, change `conformal_coverage`, switch it to lab or delete it, the app removes the sensors it no longer updates within about two minutes. Their recorded history stays in Home Assistant.
 
 ---
 
