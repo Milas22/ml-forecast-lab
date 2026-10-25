@@ -103,7 +103,7 @@ class _StubHA:
         return default
 
 
-def _train(tmp_path, monkeypatch, covs, backend="lightgbm"):
+def _train(tmp_path, monkeypatch, covs, backend="lightgbm", ha=None):
     """Retrain a real production model at ``NOW``; return ``(app, cache, ha, exp)``."""
     exp = ExperimentCfg(
         name="tx", target_entity="sensor.load", mode="production",
@@ -124,7 +124,7 @@ def _train(tmp_path, monkeypatch, covs, backend="lightgbm"):
 
     app = MLForecastLabApp()
     app.history_db = HistoryDB(str(tmp_path / "h.db"))
-    ha = _StubHA()
+    ha = ha or _StubHA()
     app.ha_interface = ha
     app.config = AppConfig(experiments=[exp], model_overrides={
         "lightgbm": {"n_estimators": 60}, "nlinear": {"epochs": 2}})
@@ -358,6 +358,36 @@ class TestTreeForecast:
         np.testing.assert_allclose(
             _col(res, cache, "outdoor"), _log_pinned(_forecast(res.ds_future), rec), rtol=1e-5,
         )
+
+    def test_no_numeric_history_drops_the_forecast_and_says_so(self, tmp_path, monkeypatch, caplog):
+        """A categorical state leaves the history all-NaN, so the log offset
+        cannot be fixed: the forecast is not used, and both the 0%-coverage
+        warning and the forecast path say so."""
+        cond = "sensor.outdoor_condition"
+
+        class _Categorical(_StubHA):
+            def __init__(self):
+                super().__init__()
+                self.rows[cond] = [dict(r, state="partlycloudy")
+                                   for r in self.rows["sensor.outdoor"]]
+
+            async def get_state(self, entity_id, default=None, attribute=None):
+                if entity_id == cond:
+                    entity_id = "sensor.outdoor"
+                return await super().get_state(entity_id, default, attribute)
+
+        covs = FUTURE_LOG + [CovariateCfg(entity=cond, role="future", transform="log")]
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            app, cache, ha, _ = _train(tmp_path, monkeypatch, covs, ha=_Categorical())
+        assert cache["covariate_transforms"]["outdoor_condition"] == {"transform": "log"}
+        json.dumps(_cache_meta(cache)["covariate_transforms"], allow_nan=False)
+        assert "Its forecast values are not used either" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            res = _tick(app, cache, ha)
+        assert res.status == "ok"
+        assert res.diag["future_covariates"] == ["outdoor"]
+        assert "'outdoor_condition': forecast values not used" in caplog.text
 
     def test_record_round_trips_through_cache_meta(self, tmp_path, monkeypatch):
         app, cache, _, exp = _train(tmp_path, monkeypatch, FUTURE_LOG)

@@ -1,6 +1,6 @@
 """v2.54.0: the recursive tree forecast computes ``y_rolling_std_*`` as training does.
 
-Defect pinned (live up to v2.53.0): both recursive row builders
+Defect pinned (live up to v2.52.7): both recursive row builders
 (``_run_production_inference`` and ``_compute_cached_forecast``) computed the
 rolling standard deviation with ``np.std`` (``ddof=0``), while
 ``build_features`` uses pandas' rolling ``std`` (``ddof=1``). Every tree

@@ -21,8 +21,8 @@
 
 - If a covariate in `mlfl.yaml` had `transform` set, its forecast values
   reached the model untransformed, which could pull forecasts well off.
-- For a covariate that goes below zero, or now and then reads exactly zero,
-  the transform could also drift between retrains.
+- For a covariate that goes below zero, or, with `log`, now and then reads
+  exactly zero, the transform could also drift between retrains.
 - Each covariate's transform is now fixed when the model is trained and used
   for both its history and its forecast values.
 - Forecasts for these experiments change after the update, so compare their
@@ -51,7 +51,8 @@
 **Tree-model forecasts measure recent ups and downs the way training did.**
 
 - Tree models learned from how much the sensor had varied over its last few
-  readings, but when forecasting were given a figure up to about 9% smaller.
+  readings, but when forecasting were given a smaller figure: about 9%
+  smaller at the default 30-minute interval, about 18% at longer intervals.
 - They are now given the same figure, so their forecasts can shift slightly.
 - Benchmark scores and rankings are unchanged.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-forecast-input-scale.md)

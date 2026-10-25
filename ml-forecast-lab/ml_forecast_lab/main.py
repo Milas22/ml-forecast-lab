@@ -669,13 +669,21 @@ def _covariate_transform_record(series, transform) -> dict:
     return {"transform": t, "shift": float(shift), "min": float(low)}
 
 
+def _transform_display(t) -> str:
+    """The name a user sets in ``mlfl.yaml``: ``shifted_log`` is recorded
+    for ``box_cox``."""
+    return "box_cox" if t == "shifted_log" else (t or "none")
+
+
 def _describe_transform(series) -> str:
     """``log (shift 1)`` for the covariate manifest line; '' untransformed."""
     t = series.attrs.get("transform")
     if t is None:
         return ""
     shift = series.attrs.get("transform_shift")
-    return f"{t} (shift {shift:g})" if shift is not None else t
+    if shift is None or not np.isfinite(shift):
+        return f"{_transform_display(t)} (offset unknown: no numeric history)"
+    return f"{_transform_display(t)} (shift {shift:g})"
 
 
 def _transform_label(t):
@@ -706,8 +714,11 @@ def _future_covariate_on_model_scale(series, cov_cfg, cov_name, transforms):
     v2.54.0: the four future-value paths applied ``scale`` only, so a
     covariate with ``transform`` reached the model raw at every horizon step
     while it trained on transformed values. Returns None when a log shift
-    cannot be reproduced; the caller then carries the covariate forward
-    rather than feed it raw.
+    cannot be reproduced (no numeric history to fix it from). The covariate
+    is then not fed its forecast: tree callers carry its last value forward,
+    and neural callers leave its future positions at 0, as for any missing
+    forecast. Either way that matches training, where the all-NaN column was
+    imputed as 0.
     """
     if cov_cfg.scale is not None:
         series = series * cov_cfg.scale
@@ -715,6 +726,11 @@ def _future_covariate_on_model_scale(series, cov_cfg, cov_name, transforms):
     if rec.get("transform") is None:
         return series
     if not _transform_record_complete(rec):
+        logger.warning(
+            f"  Covariate '{cov_name}': forecast values not used — its "
+            f"{_transform_display(rec.get('transform'))} offset could not be "
+            f"fixed, as its history has no numeric readings."
+        )
         return None
     return _apply_covariate_transform(series, rec)
 
@@ -3375,9 +3391,10 @@ class MLForecastLabApp:
                             logger.info(
                                 f"    {cov_cfg.entity}: forecasting with the "
                                 f"transform the model was trained with "
-                                f"({_rec.get('transform')}); the configured "
-                                f"transform ({cov_cfg.transform}) takes effect "
-                                f"at the next retrain."
+                                f"({_transform_display(_rec.get('transform'))}); "
+                                f"the configured transform "
+                                f"({_transform_display(cov_cfg.transform)}) "
+                                f"takes effect at the next retrain."
                             )
                     else:
                         _t = _rec["transform"] if _rec is not None else cov_cfg.transform
@@ -3544,11 +3561,13 @@ class MLForecastLabApp:
             # role for that column would discard it, otherwise zero-fill
             # so the future-side channel still gets values at inference.
             cov_roles_by_name: Dict[str, set] = {}
+            cov_tx_by_name: Dict[str, Optional[str]] = {}
             for c in exp_cfg.covariates:
                 col_name = _cov_column_name(c, all_covs=exp_cfg.covariates)
                 cov_roles_by_name.setdefault(col_name, set()).add(
                     getattr(c, 'role', 'lagged')
                 )
+                cov_tx_by_name[col_name] = c.transform
             empty_cols = [
                 c for c in result.columns
                 if c != 'y' and result[c].notna().sum() == 0
@@ -3575,15 +3594,31 @@ class MLForecastLabApp:
                     # physically meaningful zero as a measurement.
                     if col in stats_by_name:
                         stats_by_name[col]["fate"] = "masked (no history)"
+                    # v2.54.0: a log/box_cox offset is fixed from history;
+                    # with none, the forecast values cannot be put on the
+                    # model's scale and are not used.
+                    _rec = (covariate_transforms or {}).get(col) or {
+                        "transform": cov_tx_by_name.get(col),
+                    }
+                    if _transform_record_complete(_rec):
+                        _future_note = (
+                            "Future values still come from the forecast "
+                            "attribute / service API at inference."
+                        )
+                    else:
+                        _future_note = (
+                            f"Its forecast values are not used either: its "
+                            f"{_transform_display(_rec.get('transform'))} "
+                            f"offset needs numeric history to be fixed. Set "
+                            f"future_value_key if the state is not numeric."
+                        )
                     logger.warning(
                         "  Covariate '%s' (role=%s) had 0%% "
                         "historical coverage — filling past with 0 so "
-                        "the experiment isn't killed. Future values "
-                        "still come from the forecast attribute / "
-                        "service API at inference. For richer past "
+                        "the experiment isn't killed. %s For richer past "
                         "signal on weather.* entities, add the per-"
                         "metric sensor.* sibling entity as a separate "
-                        "role:lagged covariate.", col, role_label,
+                        "role:lagged covariate.", col, role_label, _future_note,
                     )
                 else:
                     # Lagged-only column with 0% coverage adds nothing.
