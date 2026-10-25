@@ -11,6 +11,10 @@ Defects pinned (all live up to v2.52.7):
 - Covariates were picked by name shape, so one named ``y_*`` was fed 0.0 and
   the interactions of one named ``*_missing`` were fed 0.0.
 
+Computed solar columns are excluded from the fill by the experiment's config,
+not by name: a fetched covariate on ``sensor.sun_elevation`` is filled like
+any other.
+
 The neural path is deliberately unchanged: with no observation at all its
 past window would be invented, and the channel-parity guard refuses it.
 """
@@ -35,8 +39,8 @@ from ml_forecast_lab.db import HistoryDB
 from ml_forecast_lab.features import is_holiday
 from ml_forecast_lab.main import (
     MLForecastLabApp, _cache_entry_from_meta, _cache_meta,
-    _fitted_source_columns, _inference_indicator_map, _pinned_indicator_map,
-    _reinstate_trained_covariates,
+    _computed_source_columns, _fitted_source_columns, _inference_indicator_map,
+    _pinned_indicator_map, _reinstate_trained_covariates,
 )
 from ml_forecast_lab.models.registry import ModelRegistry
 from ml_forecast_lab.preprocessing import resolve_missingness
@@ -82,9 +86,12 @@ class _StubHA:
 
 
 def _train(tmp_path, monkeypatch, *, backend="lightgbm", covs=None, ents=None,
-           country=None, gap=True, now=NOW):
+           country=None, gap=True, now=NOW, **exp_kw):
     """Retrain a real production model on synthetic history; return
-    ``(app, cache, ha, exp)`` with the covariate SQLite cache warm."""
+    ``(app, cache, ha, exp)`` with the covariate SQLite cache warm.
+
+    ``max_age`` is set far out so cache pruning, which runs against the
+    wall clock, never reaches the fixed ``now``."""
     gap_span = (now - timedelta(days=4, hours=6), now - timedelta(days=4))
     if covs is None:
         covs = [CovariateCfg(entity="sensor.temp", role="lagged")]
@@ -95,7 +102,7 @@ def _train(tmp_path, monkeypatch, *, backend="lightgbm", covs=None, ents=None,
         name="adv", target_entity="sensor.load", mode="production",
         interval_minutes=30, future_periods=24, days_history=10,
         country=country, covariates=covs, models_enabled=[backend],
-        production_model=backend,
+        production_model=backend, max_age=36500, **exp_kw,
     )
     monkeypatch.setattr(
         MLForecastLabApp, "_cached_model_dir",
@@ -203,11 +210,46 @@ class TestAbsentCovariateTree:
         assert np.all(_col(res, old, "temp") == 0.0)
         assert np.all(_col(res, old, "temp_missing") == 1.0)
 
+    def test_gap_free_covariate_is_filled_but_not_flagged(self, tmp_path, monkeypatch, caplog):
+        app, cache, ha, _ = _train(tmp_path, monkeypatch, gap=False)
+        assert "temp_missing" not in cache["feature_cols"]
+        ha.fail = {"sensor.temp"}
+        _cold(app, ha)
+        with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
+            res = _tick(app, cache)
+        assert res.status == "ok"
+        np.testing.assert_allclose(
+            _col(res, cache, "temp"), cache["covariate_fill"]["temp"], rtol=1e-6,
+        )
+        msg = next(r.getMessage() for r in caplog.records
+                   if "missing from this cycle's data" in r.getMessage())
+        assert "not flagged" in msg and "flagged as imputed" not in msg
+
+    def test_covariate_named_like_a_solar_column_is_filled(self, tmp_path, monkeypatch):
+        gap_span = (NOW - timedelta(days=4, hours=6), NOW - timedelta(days=4))
+        covs = [CovariateCfg(entity="sensor.sun_elevation", role="lagged")]
+        ents = {"sensor.sun_elevation": _rows(_temp, NOW, skip=gap_span)}
+        app, cache, ha, _ = _train(tmp_path, monkeypatch, covs=covs, ents=ents)
+        fill = cache["covariate_fill"]["sun_elevation"]
+        assert 5.0 <= fill <= 15.0
+        # Held like any lagged covariate, never swapped for pvlib values.
+        healthy = _col(_tick(app, cache), cache, "sun_elevation")
+        assert np.unique(healthy).size == 1 and 5.0 <= healthy[0] <= 15.0
+        ha.fail = {"sensor.sun_elevation"}
+        _cold(app, ha)
+        res = _tick(app, cache)
+        assert res.status == "ok"
+        assert res.diag["reinstated_covariates"] == ["sun_elevation"]
+        np.testing.assert_allclose(_col(res, cache, "sun_elevation"), fill, rtol=1e-6)
+        assert np.all(_col(res, cache, "sun_elevation_missing") == 1.0)
+
     def test_healthy_tick_is_unchanged(self, tmp_path, monkeypatch, caplog):
         app, cache, _, _ = _train(tmp_path, monkeypatch)
         with caplog.at_level(logging.WARNING, logger="ml_forecast_lab.main"):
             res = _tick(app, cache)
-        monkeypatch.setattr(M, "_reinstate_trained_covariates", lambda df, fc: (df, []))
+        monkeypatch.setattr(
+            M, "_reinstate_trained_covariates", lambda df, fc, computed: (df, []),
+        )
         same = _tick(app, cache)
         np.testing.assert_array_equal(res.diag["X_rows"], same.diag["X_rows"])
         np.testing.assert_array_equal(res.y_pred, same.y_pred)
@@ -294,16 +336,27 @@ class TestSchemaHelpers:
     def test_nothing_absent_returns_the_same_frame(self):
         df = pd.DataFrame({"y": [1.0], "temp": [2.0], "pump": [0.0],
                            "pump_missing": [1.0], "clear_sky_ghi": [0.0]})
-        out, reinstated = _reinstate_trained_covariates(df, FC)
+        out, reinstated = _reinstate_trained_covariates(df, FC, frozenset())
         assert out is df and reinstated == []
 
     def test_absent_columns_reinstated_in_fitted_order_never_computed_ones(self):
         df = pd.DataFrame({"y": [1.0], "pump_missing": [1.0], "other": [3.0]})
-        out, reinstated = _reinstate_trained_covariates(df, FC)
+        computed = _computed_source_columns(ExperimentCfg(name="e", target_entity="sensor.t"))
+        out, reinstated = _reinstate_trained_covariates(df, FC, computed)
         assert reinstated == ["temp", "pump"]
         assert list(out.columns) == ["y", "temp", "pump", "pump_missing", "other"]
         assert out["temp"].isna().all()
         assert "clear_sky_ghi" not in out.columns
+
+    def test_computed_columns_follow_the_config(self):
+        both = {"clear_sky_ghi", "sun_elevation"}
+        base = dict(name="e", target_entity="sensor.t")
+        user = dict(base, covariates=[CovariateCfg(entity="sensor.sun_elevation")])
+        assert _computed_source_columns(ExperimentCfg(**base)) == both
+        assert _computed_source_columns(ExperimentCfg(**user)) == {"clear_sky_ghi"}
+        assert _computed_source_columns(
+            ExperimentCfg(**user, include_sun_elevation=True),
+        ) == both
 
     def test_resolve_missingness_without_fill_is_unchanged(self):
         idx = pd.date_range("2026-10-01", periods=40, freq="30min")

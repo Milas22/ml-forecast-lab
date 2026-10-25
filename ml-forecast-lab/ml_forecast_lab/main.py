@@ -584,10 +584,30 @@ def _seed_lag_buffer(grid_y, fallback, last_ts, n_values: int):
     )
 
 
-# Columns ``_fetch_and_preprocess`` computes from the grid rather than fetches.
-# Never reinstated as all-NaN: ``clear_sky_ghi``'s mere presence switches on
-# build_features' night gate, which would zero every lag against a NaN ghi.
-_COMPUTED_SOURCE_COLUMNS = frozenset({"sun_elevation", "clear_sky_ghi"})
+def _computed_source_columns(exp_cfg) -> frozenset:
+    """Solar columns ``exp_cfg`` gets from pvlib rather than from a sensor:
+    never filled or reinstated, and recomputed for every future step.
+
+    v2.53.0: decided from the config, not the name — a covariate on
+    ``sensor.sun_elevation`` is fetched like any other, so it is filled
+    when HA returns nothing for it and held like any lagged covariate
+    across the horizon. It counts as the user's only while
+    ``include_sun_elevation`` is off (when on, the computed column
+    overwrites it in ``_fetch_and_preprocess``). ``clear_sky_ghi`` is
+    computed whatever its origin: build_features' night gate keys on the
+    name, so an all-NaN column would zero every lag.
+    """
+    out = {"clear_sky_ghi"}
+    # The entity's bare name, not _cov_column_name: that warns on duplicate
+    # configs, and a suffixed duplicate never yields a bare column anyway.
+    fetched = {
+        c.entity.split(".")[-1]
+        for c in (getattr(exp_cfg, "covariates", None) or [])
+    }
+    if ("sun_elevation" not in fetched
+            or getattr(exp_cfg, "include_sun_elevation", False)):
+        out.add("sun_elevation")
+    return frozenset(out)
 
 
 def _fitted_source_columns(feature_cols) -> list:
@@ -619,7 +639,7 @@ def _pinned_indicator_map(pinned, feature_cols) -> dict:
     return out
 
 
-def _covariate_fill_values(df, feature_cols) -> dict:
+def _covariate_fill_values(df, feature_cols, computed) -> dict:
     """Per fitted covariate, what ``causal_impute`` would fill a gap with at
     the end of the training window: the median of its observations, or the
     last one for a binary channel. Stored with the model for a covariate
@@ -629,7 +649,7 @@ def _covariate_fill_values(df, feature_cols) -> dict:
     out = {}
     for c in feature_cols:
         if (f"{c}_x_hour_sin" not in fitted or c not in df.columns
-                or c in _COMPUTED_SOURCE_COLUMNS):
+                or c in computed):
             continue
         obs = df[c].dropna()
         if obs.empty:
@@ -638,7 +658,7 @@ def _covariate_fill_values(df, feature_cols) -> dict:
     return out
 
 
-def _reinstate_trained_covariates(df, feature_cols):
+def _reinstate_trained_covariates(df, feature_cols, computed):
     """Give back, as all-NaN columns, covariates the model was fitted on but
     the fresh fetch left out. Returns ``(frame, reinstated)``.
 
@@ -650,14 +670,15 @@ def _reinstate_trained_covariates(df, feature_cols):
     As an all-NaN column it is masked, imputed and flagged like any gap.
 
     Source columns are read off the fitted schema — build_features gives
-    every one an ``_x_hour_sin`` pair — never off a name suffix. Placed in
+    every one an ``_x_hour_sin`` pair — never off a name suffix. Columns in
+    ``computed`` (``_computed_source_columns``) are left out. Placed in
     fitted order so tree columns and neural channels line up. A frame
     missing nothing is returned as the same object.
     """
     sources = _fitted_source_columns(feature_cols)
     absent = [
         c for c in sources
-        if c not in df.columns and c not in _COMPUTED_SOURCE_COLUMNS
+        if c not in df.columns and c not in computed
     ]
     if not absent:
         return df, []
@@ -2051,16 +2072,19 @@ class MLForecastLabApp:
             return None
         return self._site_location
 
-    async def _future_solar_frame(self, future_index, cov_cols):
+    async def _future_solar_frame(self, future_index, cov_cols, computed):
         """pvlib ``sun_elevation`` / ``clear_sky_ghi`` for the forecast grid.
 
         Computed for whichever of the two is in ``cov_cols`` — the columns
         the tree was trained on — so the recursive loops never carry the
-        ``last_ts`` value across the horizon. None when neither is present,
-        the site location is unknown, or pvlib fails.
+        ``last_ts`` value across the horizon. v2.53.0: and in ``computed``
+        (``_computed_source_columns``), so a sensor the tree was trained on
+        under that name is not swapped for pvlib values. None when neither
+        is present, the site location is unknown, or pvlib fails.
         """
         solar_cols = [
-            c for c in ("sun_elevation", "clear_sky_ghi") if c in cov_cols
+            c for c in ("sun_elevation", "clear_sky_ghi")
+            if c in cov_cols and c in computed
         ]
         if not solar_cols:
             return None
@@ -5402,7 +5426,7 @@ class MLForecastLabApp:
             # the lag buffer at night steps, keeping the recursive feature
             # vectors in the distribution the tree saw during training.
             prod_future_solar = await self._future_solar_frame(
-                future_index, raw_cov_cols,
+                future_index, raw_cov_cols, _computed_source_columns(exp_cfg),
             )
 
             # Lag buffer: chronological, grows with each prediction.
@@ -6472,7 +6496,9 @@ class MLForecastLabApp:
             "missing_indicators": list(
                 missing_report.get("indicator_cols", [])
             ),
-            "covariate_fill": _covariate_fill_values(df, feature_cols),
+            "covariate_fill": _covariate_fill_values(
+                df, feature_cols, _computed_source_columns(exp_cfg),
+            ),
             "combined": combined,
             "exp_cfg": exp_cfg,
             "trained_at": trained_at,
@@ -7829,16 +7855,33 @@ class MLForecastLabApp:
             _fill = cache.get("covariate_fill") or {}
             if not (is_neural and 'sequence_data' in seq_kwargs):
                 df_fresh, _reinstated = _reinstate_trained_covariates(
-                    df_fresh, feature_cols,
+                    df_fresh, feature_cols, _computed_source_columns(exp_cfg),
                 )
             if _reinstated:
+                # Flagged only where the model was fitted with that
+                # covariate's indicator; one trained gap-free has none.
+                # A cache from before v2.53.0 has no fill: 0.0.
+                _pinned_src = set(_pinned_indicator_map(
+                    cache.get("missing_indicators") or [], feature_cols,
+                ).values())
+                _notes = []
+                _flagged = [c for c in _reinstated if c in _pinned_src]
+                _unflagged = [c for c in _reinstated if c not in _pinned_src]
+                if _flagged:
+                    _notes.append(f"flagged as imputed: {_flagged}")
+                if _unflagged:
+                    _notes.append(
+                        f"not flagged, as the model was trained with no "
+                        f"gaps in them: {_unflagged}"
+                    )
                 logger.warning(
                     f"  {exp_cfg.name}: covariate(s) {_reinstated} the model "
                     f"was trained on are missing from this cycle's data (no "
                     f"history returned, or removed from the config) — "
                     f"forecasting with them held at "
-                    f"{ {c: _fill.get(c, 0.0) for c in _reinstated} } and "
-                    f"flagged as imputed until the next retrain."
+                    f"{ {c: _fill.get(c, 0.0) for c in _reinstated} }; "
+                    f"{'; '.join(_notes)}. This lasts until the covariate "
+                    f"returns or the next retrain."
                 )
                 diag["reinstated_covariates"] = list(_reinstated)
             features_fresh = build_features(
@@ -8245,7 +8288,7 @@ class MLForecastLabApp:
             # should NOT carry forward the last value — that would leave the
             # recursive forecast stuck in a single point of the day.
             future_solar = await self._future_solar_frame(
-                future_index, raw_cov_cols,
+                future_index, raw_cov_cols, _computed_source_columns(exp_cfg),
             )
 
             def _build_feature_row(ts: pd.Timestamp, buf: list, step_idx: int) -> dict:

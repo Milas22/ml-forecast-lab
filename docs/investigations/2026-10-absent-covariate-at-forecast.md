@@ -24,7 +24,7 @@ python -m pytest tests/unit/test_absent_covariate_forecast.py tests/unit/test_co
 | **A.** A covariate the model was trained on arrived with no column at forecast time | Tree model fed `0.0`, pinned `<col>_missing` zero-filled ("measured"), `row_dict.get(c, 0.0)` kept the nan_to_num backstop silent. Repro: trained on 5–15, fed 0.0; forecast moved 0.31 (2.12 for a gap-free-trained covariate) on a ~21 target | `_reinstate_trained_covariates` puts the column back as all-NaN; `resolve_missingness(empty_fill=…)` fills it with the cached `covariate_fill` (the training-window statistic) and flags it |
 | **B.** `CovariateResolver._fetch_raw_history` let an HA error escape, and `fetch_history` then returned an empty series, discarding the SQLite rows it had read | The column vanished (A) on every HA hiccup, in training and benchmarks too | On an HA error with cached rows, serve the cache. The unreturned tail is masked, imputed and flagged like any gap. The backfill horizon is not recorded, so the next cycle retries |
 | **C.** Neither recursive row builder set `is_holiday` | Tree experiments with `country` set always forecast holidays as ordinary days (repro: IE, 26 Oct 2026) | Both builders set `is_holiday(ts, exp_cfg.country)` when the feature is fitted |
-| **D.** Covariates were picked by name shape (`startswith('y_')`, `endswith('_missing')`) | `y_*` covariates fed 0.0 with their interactions; `*_missing` covariates' interactions fed 0.0 | `_fitted_source_columns` reads sources off the fitted schema (every source has an `_x_hour_sin` pair); `_pinned_indicator_map` maps the cache's pinned indicators, including `_missing_flag` collisions |
+| **D.** Covariates were picked by name shape (`startswith('y_')`, `endswith('_missing')`, `== 'sun_elevation'`) | `y_*` covariates fed 0.0 with their interactions; `*_missing` covariates' interactions fed 0.0; a lagged covariate column `sun_elevation` had every future row replaced by pvlib sun elevation | `_fitted_source_columns` reads sources off the fitted schema (every source has an `_x_hour_sin` pair); `_pinned_indicator_map` maps the cache's pinned indicators, including `_missing_flag` collisions; `_computed_source_columns` decides which solar columns are pvlib's from the config, and `_future_solar_frame` computes only those |
 
 Both recursive builders now default an unproduced feature to NaN, so any
 remaining hole reaches `_nan_to_num_guarded` and warns with its name instead
@@ -68,14 +68,30 @@ own flagged rows.
   - The channel-parity guard already refuses that forecast (`channel_mismatch`),
     so the neural path fails safe.
   - Fix B removes its common trigger.
-- **Computed columns are never reinstated.** `sun_elevation` and
-  `clear_sky_ghi` are excluded: a NaN `clear_sky_ghi` switches on
-  `build_features`' night gate and would zero every lag.
+- **Computed columns are decided from the config, not the name.**
+  `_computed_source_columns(exp_cfg)` drives three things: no fill is
+  stored for these columns, they are never reinstated, and only they get
+  pvlib values on future steps.
+  - `sun_elevation` belongs to the user only when a configured covariate
+    resolves to that column and `include_sun_elevation` is off. When it is
+    on, `_fetch_and_preprocess` writes the pvlib column over the sensor's.
+  - Otherwise it is pvlib's. This includes a model trained with
+    `include_sun_elevation` that is now off: it keeps getting pvlib values
+    rather than a 0.0 fill.
+  - `clear_sky_ghi` is always pvlib's. `build_features`' night gate keys on
+    the name, so an all-NaN reinstated column would zero every lag. A
+    sensor under that name is effectively a reserved name; that is
+    unchanged.
+  - The neural path is left name-based. Training and inference both build
+    the future block's `sun_elevation` from pvlib, so they agree with each
+    other.
 - **Gap-free experiments are unchanged.**
   - Nothing absent returns the same frame object.
   - `empty_fill` stays `None`.
   - The schema-derived source list and pinned map equal the old name filter
     and suffix map for ordinary names.
+  - The computed set is both solar columns unless a covariate resolves to
+    `sun_elevation`, so `_future_solar_frame` computes what it did before.
   - The adversarial check measured `X_train` bit-identical across 13 healthy
     scenarios. Healthy-tick rows and `y_pred` were bit-identical apart from
     the intended C and D corrections.
@@ -107,7 +123,8 @@ flagged, never worse than before. The next scheduled retrain writes it.
   WARNING rather than the "No data for covariate" / 0%-coverage warnings.
 - A model trained gap-free on a covariate has no pinned indicator, so its
   fill is fed unflagged. This is the same accepted behaviour as a
-  present-but-NaN tail today.
+  present-but-NaN tail today. The reinstatement warning lists flagged and
+  unflagged covariates separately.
 - **Found in the same review, not fixed here:**
   - `cov_cfg.transform` is applied to covariate history but not to future
     values. The future paths apply only `scale`, so a future-role covariate

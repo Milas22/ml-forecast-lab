@@ -9,9 +9,11 @@
 - If Home Assistant briefly failed to return a covariate's history, tree
   models were given 0 for it, which could pull the forecast well away from
   normal.
-- The app now uses the covariate's saved history, or else its typical value
-  from training, and the log names the covariate.
-- Neural models still skip that forecast until the covariate is back.
+- All models now use the covariate's saved history when this happens.
+- With none saved, tree models use its typical value from training and the
+  log names the covariate; neural models skip that forecast until it is back.
+- Until a model is retrained on this version, it still gets 0 in that case,
+  but the log now says so.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
 
 **Public holidays reach the forecast.**
@@ -21,10 +23,12 @@
 - Forecasts for public holidays now use it, so they can change on those days.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
 
-**Covariates named like `y_…` or `…_missing` keep their values.**
+**Covariates named like `y_…`, `…_missing` or `sun_elevation` keep their values.**
 
 - A covariate whose sensor name started with `y_` was fed 0 when forecasting,
   and one ending in `_missing` lost part of its signal.
+- Tree models forecasting with a covariate sensor named `sun_elevation` were
+  given the app's own sun position in its place.
 - They are now fed their real values, so forecasts that use them can change.
 - [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
 

@@ -499,7 +499,8 @@ def test_failed_backfill_is_retried_next_cycle(db):
             )
 
     iface = _FlakyIface(rows)
-    resolver = CovariateResolver(iface, history_db=db)
+    # Retention prunes against the wall clock; keep it clear of `now`.
+    resolver = CovariateResolver(iface, history_db=db, cache_max_age_days=36500)
     cov = {"entity_id": "sensor.x", "name": "x"}
 
     # Warm a narrow window, then widen — with HA failing on that cycle.
