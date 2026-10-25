@@ -171,7 +171,8 @@ Example:
 
 - After rebooting, Home Assistant could show a "The unit has changed" repair for the add-on's
   forecast sensors, and their statistics had a gap.
-- This mostly affected forecasts of sensors created by other add-ons, such as Predbat.
+- This mostly affected experiments that forecast a sensor from another add-on, such as
+  Predbat's solar power sensor.
 - The add-on now remembers each sensor's unit across restarts.
 - If Home Assistant shows this repair, choose **Close** rather than **Fix issue**; it clears
   itself within a couple of hours.
