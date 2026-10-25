@@ -149,16 +149,17 @@ dialog renders every section between the installed and the latest version, often
 to people who use the add-on but don't read its code. Write for that reader. House style:
 
 - Sections `### Added` / `### Fixed` / `### Changed` only, in that order.
-- Each item is a **bold sentence stating what is better for the user**, then at most three short,
-  plain sentences: what they may have noticed, what is different now, and anything they should
-  do. Aim for under ~80 words per item.
+- Each item is a **bold one-sentence summary of what is better for the user**, then a short
+  bullet list, one plain sentence per bullet: what they may have noticed, who is affected (when
+  not everyone), what is different now, and anything they should do. 2–5 bullets; aim for under
+  ~80 words per item.
 - Use the words people see in HA and the add-on's UI: sensor names, the Repairs page, tab names,
   `mlfl.yaml` keys they set. No function names, code paths, HTTP codes, attribute values or
   internal terms ("publish", "resolve", "cache", "target"). Name a cause only when it tells the
   user whether they're affected, and then in their terms ("if you use Predbat").
-- Put any action the user must take in its own sentence ("If HA shows this repair, choose **Close**").
+- Give any action the user must take its own bullet ("If HA shows this repair, choose **Close**").
 - Causes, mechanisms, measurements, design choices and review findings go in
-  `docs/investigations/*.md`, linked at the end of the item as `[Technical details](<absolute
+  `docs/investigations/*.md`, linked as the item's last bullet, `[Technical details](<absolute
   GitHub URL>)`, never inlined.
 - Factual, past tense for what was wrong, no marketing.
 - The duplicate `## 2.49.2` heading is a known pre-existing quirk — leave it.
@@ -166,11 +167,15 @@ to people who use the add-on but don't read its code. Write for that reader. Hou
 Example:
 
 ```markdown
-**Forecast sensors keep their unit after a restart.** After rebooting, Home Assistant could
-show a "The unit has changed" repair for the add-on's forecast sensors, and their statistics
-had a gap. The add-on now remembers each sensor's unit across restarts. If Home Assistant
-shows this repair, choose **Close** rather than **Fix issue**; it clears itself within a couple
-of hours. [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
+**Forecast sensors keep their unit after a restart.**
+
+- After rebooting, Home Assistant could show a "The unit has changed" repair for the add-on's
+  forecast sensors, and their statistics had a gap.
+- This mostly affected forecasts of sensors created by other add-ons, such as Predbat.
+- The add-on now remembers each sensor's unit across restarts.
+- If Home Assistant shows this repair, choose **Close** rather than **Fix issue**; it clears
+  itself within a couple of hours.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-unit-repairs-after-restart.md)
 ```
 
 ## Architecture
