@@ -156,7 +156,9 @@ to people who use the add-on but don't read its code. Write for that reader. Hou
 - Use the words people see in HA and the add-on's UI: sensor names, the Repairs page, tab names,
   `mlfl.yaml` keys they set. No function names, code paths, HTTP codes, attribute values or
   internal terms ("publish", "resolve", "cache", "target"). Name a cause only when it tells the
-  user whether they're affected, and then in their terms ("if you use Predbat").
+  user whether they're affected, and then in their terms ("a sensor from another add-on").
+- Don't name other projects, add-ons, integrations or vendors; describe them generically.
+  Specifics belong in the linked investigation note.
 - Give any action the user must take its own bullet ("If HA shows this repair, choose **Close**").
 - Causes, mechanisms, measurements, design choices and review findings go in
   `docs/investigations/*.md`, linked as the item's last bullet, `[Technical details](<absolute
@@ -171,8 +173,7 @@ Example:
 
 - After rebooting, Home Assistant could show a "The unit has changed" repair for the add-on's
   forecast sensors, and their statistics had a gap.
-- This mostly affected experiments that forecast a sensor from another add-on, such as
-  Predbat's solar power sensor.
+- This mostly affected experiments that forecast a sensor from another add-on.
 - The add-on now remembers each sensor's unit across restarts.
 - If Home Assistant shows this repair, choose **Close** rather than **Fix issue**; it clears
   itself within a couple of hours.
