@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.52.7
+
+### Fixed
+
+**Forecast sensors come back within minutes after a restart.**
+
+- After restarting Home Assistant, the app's sensors could be unavailable
+  for up to half an hour; after a reboot, an experiment could have no
+  forecasts for up to a day.
+- The app now starts once Home Assistant is running and forecasts within
+  two minutes.
+- If Home Assistant restarts, the app puts its sensors back within about a
+  minute, and retries within minutes when Home Assistant isn't ready.
+- The last-retrain and last-run sensors now come back with the forecasts.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
+**The cumulative and band sensors no longer disappear.**
+
+- The cumulative sensor was left out whenever a forecast dipped below zero,
+  and the upper and lower band sensors until enough history had built up,
+  so a restart removed them.
+- They now show "unknown", with a `status` attribute saying why.
+- For forecasts that can't go below zero, such as solar power, set
+  `target_is_nonnegative: true` so the cumulative sensor gets a value.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-sensors-after-restart.md)
+
 ## 2.52.6
 
 ### Fixed

@@ -57,6 +57,7 @@ The app searches these in order: explicit `--config-path` (development only) →
 | `forecast_every_minutes` | int | inherits global | Per-experiment override of the inference cadence. |
 | `retrain_every_hours` | float | inherits global | Per-experiment override of the retrain cadence. |
 | `country` | ISO code | unset | Two-letter country code for holiday features (`GB`, `US`, `DE`, …). Unset = no holiday feature. |
+| `target_is_nonnegative` | bool | `false` | Set `true` for targets that can't go below zero (solar power, irradiance, demand). Forecasts are clamped at zero, so `_cumulative` always has a value, and solar experiments fill missing night-time readings with zero when training. Cumulative sources get this automatically. |
 | `units` | string | `""` | Target units (`W`, `kWh`, `%`, …). Shown in the UI and on published sensors. If left blank, the unit is auto-inherited from the target sensor's own `unit_of_measurement` in Home Assistant — so for most experiments you don't need to set this at all. The inherited unit is remembered across restarts, so a target Home Assistant hasn't re-created yet after a reboot doesn't strip the unit from the forecast sensors. |
 | `max_age` | int (days) | `365` | Cap on rows kept in the SQLite cache for this experiment's target, covariates and state-mode external forecasts. The cache is always-on (v2.33.1+); older rows are pruned each cycle. Cache tables are keyed by entity, so when several experiments reference the same entity the table is pruned at the **largest** `max_age` among them (v2.50.0+) — a short-`max_age` experiment can no longer delete history a longer-lived one still trains on. Set this at least as large as `days_history`, or the cache is pruned back inside the window you train on. |
 | `publish_prefix` | string | `mlfl_` | Prefix for every companion sensor. Change only if you have a naming clash. |
@@ -370,12 +371,15 @@ When an experiment is in `mode: production`, the app publishes the following sen
 |---|---|---|
 | `sensor.mlfl_<name>_forecast` | The next interval's forecast value. | Attributes include the full future curve as a list of `{datetime, value}` pairs. |
 | `sensor.mlfl_<name>_interval` | The next interval's value, expressed as a per-interval increment. | Published only when `source_is_cumulative` is true (otherwise identical to `_forecast`). |
-| `sensor.mlfl_<name>_cumulative` | The integrated forecast curve. Resets at local midnight when `source_is_cumulative` and `reset_daily` are both true; otherwise a `cumsum` anchored at zero. | Useful for daily-budget automations (EV planning, hot-water tank pre-heat). |
-| `sensor.mlfl_<name>_upper_<pct>` | Upper conformal band at the `<pct>` coverage level (default `80`). | Renamed to match `conformal_coverage` — e.g. `_upper_90` if you set `0.9`. Appears once enough residuals have been calibrated; cold-start may take ~10 forecast cycles. |
+| `sensor.mlfl_<name>_cumulative` | The integrated forecast curve. Resets at local midnight when `source_is_cumulative` and `reset_daily` are both true; otherwise a `cumsum` anchored at zero. | Useful for daily-budget automations (EV planning, hot-water tank pre-heat). Shows `unknown` with `status: signed_predictions` when the forecast dips below zero, because a running total of signed values drifts; for targets that can't be negative (solar power, demand) set `target_is_nonnegative: true`. |
+| `sensor.mlfl_<name>_upper_<pct>` | Upper conformal band at the `<pct>` coverage level (default `80`). | Renamed to match `conformal_coverage` — e.g. `_upper_90` if you set `0.9`. Shows `unknown` with `status: no_conformal_bands` until enough residuals have been calibrated; cold-start may take ~10 forecast cycles. |
 | `sensor.mlfl_<name>_lower_<pct>` | Lower conformal band. | As above. |
 | `sensor.mlfl_<name>_forecast_accuracy` | Mean absolute error of the next-interval forecast over the last 30 days. Per interval when `source_is_cumulative` is true. | Recomputed on every forecast publish. Attributes carry the full lead-time curve (`lead_hours`, `mae`, `rmse`, `sample_count`) and the first-versus-latest revision MAE. `status` reads `accumulating` until a next-interval forecast has been scored. |
 | `sensor.mlfl_<name>_last_benchmark` | ISO timestamp of the most recent benchmark completion. | `device_class: timestamp`. Attributes include outcome, duration, winner, and a truncated error string when the cycle failed — convenient triggers for HA automations. |
 | `sensor.mlfl_<name>_last_retrain` | ISO timestamp of the most recent retrain. | Same shape as `_last_benchmark`. |
+| `sensor.mlfl_last_run` | ISO timestamp of the app's most recent successful forecast or retrain, across all experiments. | A heartbeat: if it stops advancing, the app has stopped forecasting. |
+
+Home Assistant does not keep these sensors across its own restart. The app checks for them every minute and puts them back with the last forecast's values, then refreshes them at the next forecast. After the app itself starts, each experiment with a trained model forecasts within two minutes; an experiment still training appears when its retrain finishes.
 
 ---
 
@@ -497,9 +501,17 @@ Check the app log for `[HA]` errors. The most common causes:
 - The experiment is still in `mode: lab`. Promotion in the UI also flips the mode; if you changed YAML by hand, make sure `mode: production` is set.
 - A sensor name collision. The first publish logs `Publishing forecast for <name>: base=sensor.mlfl_<name>` — check the actual entity ID and search HA's developer tools.
 
-### Conformal bands missing from the published sensors
+### Forecast sensors unavailable after a restart
 
-`_upper_<pct>` / `_lower_<pct>` only publish once enough residuals have been calibrated (default 10 deployed predictions whose actuals have arrived). Until then the Forecast Accuracy tab shows a countdown ("Calibrating · 4 of 10 residuals · ~3 h to bands"). After ~3 forecast cycles in production the bands should appear.
+Since v2.52.7 they should be back within a couple of minutes of Home Assistant or the app starting. If one stays unavailable, look in the app log for:
+
+- `Retrying the retrain for <name>` or `Retrying the forecast for <name>` — Home Assistant wasn't answering; the app retries after 2, 5 and 15 minutes, then hourly or on the normal schedule if that is sooner.
+- `Retrain failed for <name>` without a retry line — training itself failed; the experiment's card shows the error.
+- `Timers for <name>: … retrain IMMEDIATELY (no cached model)` — there was no saved model, so the sensors appear once that retrain finishes.
+
+### Conformal bands show "unknown"
+
+`_upper_<pct>` / `_lower_<pct>` show `unknown` until enough residuals have been calibrated (default 10 deployed predictions whose actuals have arrived). Until then the Forecast Accuracy tab shows a countdown ("Calibrating · 4 of 10 residuals · ~3 h to bands"). After ~3 forecast cycles in production the bands should appear.
 
 If they vanished after a retrain: v2.24.0 had a regression where the conformal query filtered too strictly to the fresh model version. Upgrade to v2.27 or later, which falls back to pooled residuals during cold-start.
 
