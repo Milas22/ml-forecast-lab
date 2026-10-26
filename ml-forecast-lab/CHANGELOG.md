@@ -4,6 +4,15 @@
 
 ### Fixed
 
+**AutoARIMA, AutoETS and AutoTheta work again after installing or updating.**
+
+- Since early October, installing or updating the app could leave these
+  three models unable to run, so benchmarks could not score them.
+- An experiment using one of them for its forecasts could not retrain it.
+- The app now installs a version of a supporting library that works with
+  them.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-statistical-models-unavailable.md)
+
 **Forecasts no longer treat a sensor that couldn't be read as zero.**
 
 - If Home Assistant briefly failed to return a covariate's history, tree
