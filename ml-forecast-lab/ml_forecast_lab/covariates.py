@@ -405,9 +405,25 @@ class CovariateResolver:
             if fetch_start.tzinfo is None:
                 fetch_start = fetch_start.tz_localize("UTC")
             fetch_start = fetch_start.to_pydatetime()
-        raw = await self.iface.get_history(
-            entity_id, fetch_start, end, include_attributes=include_attrs,
-        )
+        try:
+            raw = await self.iface.get_history(
+                entity_id, fetch_start, end, include_attributes=include_attrs,
+            )
+        except Exception as e:
+            if len(cached) == 0:
+                raise
+            # v2.54.0: an HA error used to discard the cached rows along with
+            # the delta (fetch_history returns an empty series on any
+            # exception), so the covariate vanished from the frame and the
+            # model was fed 0.0 for it. Serve the cache instead: the stretch
+            # HA did not return is masked, imputed and flagged downstream
+            # like any other gap. The backfill horizon is not recorded.
+            logger.warning(
+                f"Covariate history fetch failed for {entity_id} ({e}); "
+                f"using {len(cached)} cached observations up to "
+                f"{cached['ds'].max()}."
+            )
+            return cached.sort_values("ds").reset_index(drop=True)
         # Record the horizon only once the fetch has actually returned. HA
         # can time out on a two-year window, and marking the attempt up
         # front would burn the one retry: the flag is monotone (`start`

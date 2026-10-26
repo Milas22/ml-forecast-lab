@@ -163,8 +163,7 @@ non-cumulative sources: it would only duplicate `_forecast`.
 
 - By design, `_last_retrain` and `_last_benchmark` stay missing after an HA
   restart until the next retrain or benchmark (see above).
-- **Not availability, found in the same review.** A covariate column absent at
-  forecast time reaches the tree path as 0.0 with its pinned `_missing`
-  indicator zero-filled (`preprocessing.py` `resolve_missingness`,
-  `row_dict.get(c, 0.0)`), contrary to the masking invariant. It changes what
-  a model is fed, so its fix is a separate minor release.
+- **Not availability, found in the same review:** a covariate column absent at
+  forecast time reached the tree path as 0.0, with its pinned `_missing`
+  indicator zero-filled. This was fixed in v2.54.0; see
+  [2026-10-absent-covariate-at-forecast.md](2026-10-absent-covariate-at-forecast.md).

@@ -7,6 +7,10 @@ xgboost>=2.0.0,<3.0.0
 catboost>=1.2.0,<2.0.0
 torch>=2.0.0
 statsforecast>=1.7.0,<2.0.0
+# statsforecast pulls in pyarrow (via fugue) without a NumPy bound, and
+# pyarrow 26 requires NumPy 2: with numpy pinned <2 above, statsforecast
+# then fails to import and ARIMA / ETS / Theta are unavailable.
+pyarrow<26.0.0
 # Zero-shot foundation-model backends (chronos_bolt, ttm). Excluded on
 # armv7: the transformers/tokenizers stack ships no 32-bit ARM wheels, and
 # a source build would push the addon build past any reasonable budget.

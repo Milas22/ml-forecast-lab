@@ -1,5 +1,71 @@
 # Changelog
 
+## 2.54.0
+
+### Fixed
+
+**AutoARIMA, AutoETS and AutoTheta work again after installing or updating.**
+
+- Since early October, installing or updating the app could leave these
+  three models unable to run, so benchmarks could not score them.
+- An experiment using one of them for its forecasts could not retrain it.
+- The app now installs a version of a supporting library that works with
+  them.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-statistical-models-unavailable.md)
+
+**Forecasts no longer treat a sensor that couldn't be read as zero.**
+
+- If Home Assistant briefly failed to return a covariate's history, tree
+  models were given 0 for it, which could pull the forecast well away from
+  normal.
+- All models now use the covariate's saved history when this happens.
+- With none saved, tree models use its typical value from training and the
+  log names the covariate; every other model skips that forecast until it is
+  back.
+- Until a tree model is retrained on this version, it still gets 0 in that
+  case, but the log now says so.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Covariates with a `transform` get forecast values on the scale they were trained on.**
+
+- If a covariate in `mlfl.yaml` had `transform` set, its forecast values
+  reached the model untransformed, which could pull forecasts well off.
+- For a covariate that goes below zero, or, with `log`, now and then reads
+  exactly zero, the transform could also drift between retrains.
+- Each covariate's transform is now fixed when the model is trained and used
+  for both its history and its forecast values.
+- Forecasts for these experiments change after the update, so compare their
+  accuracy from after the next retrain.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-forecast-input-scale.md)
+
+**Public holidays reach the forecast.**
+
+- With `country` set, tree models were trained with the holiday feature but
+  always forecast as if no day was a holiday.
+- Forecasts for public holidays now use it, so they can change on those days.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Covariates named like `y_…`, `…_missing` or `sun_elevation` keep their values.**
+
+- In tree models, a covariate whose sensor name started with `y_` was fed 0
+  when forecasting, and one ending in `_missing` lost part of its signal.
+- With `include_sun_elevation` off, a covariate sensor named `sun_elevation`
+  was replaced by the app's own sun position when forecasting.
+- They are now fed their own readings like any other covariate, so forecasts
+  that use them can change.
+- If your `sun_elevation` sensor is the sun's elevation, set
+  `include_sun_elevation: true` so each forecast step gets its own value.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-absent-covariate-at-forecast.md)
+
+**Tree-model forecasts measure recent ups and downs the way training did.**
+
+- Tree models learned from how much the sensor had varied over its last few
+  readings, but when forecasting were given a smaller figure: about 9%
+  smaller at the default 30-minute interval, about 18% at longer intervals.
+- They are now given the same figure, so their forecasts can shift slightly.
+- Benchmark scores and rankings are unchanged.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-forecast-input-scale.md)
+
 ## 2.52.7
 
 ### Fixed
