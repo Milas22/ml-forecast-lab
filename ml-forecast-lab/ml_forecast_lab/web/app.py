@@ -56,6 +56,11 @@ def _json_safe(obj: Any) -> Any:
     return obj
 
 from ml_forecast_lab import __version__ as APP_VERSION
+from ml_forecast_lab.ha_interface import (
+    ha_base_url,
+    ha_ssl_kwargs,
+    ha_token,
+)
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.gzip import GZipMiddleware
@@ -2534,7 +2539,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         })
 
     async def _probe_weather_forecast_keys(
-        ha_url: str, ha_token: str, entity_id: str, forecast_type: str,
+        ha_url: str, token: str, entity_id: str, forecast_type: str,
         val_keys_priority: set,
     ) -> Optional[List[str]]:
         """One-shot call to ``weather.get_forecasts?return_response`` for
@@ -2551,12 +2556,13 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         import aiohttp as _aiohttp
         try:
             async with _aiohttp.ClientSession() as sess:
-                headers = {"Authorization": f"Bearer {ha_token}"}
+                headers = {"Authorization": f"Bearer {token}"}
                 async with sess.post(
                     f"{ha_url}/api/services/weather/get_forecasts?return_response",
                     headers=headers,
                     json={"entity_id": entity_id, "type": forecast_type},
                     timeout=_aiohttp.ClientTimeout(total=5),
+                    **ha_ssl_kwargs(),
                 ) as resp:
                     if resp.status != 200:
                         return None
@@ -2597,12 +2603,12 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
 
         # Refresh cache every 60 seconds
         if now - _entity_cache["ts"] > 60:
-            ha_url = os.environ.get("HA_URL", "http://supervisor/core")
-            ha_token = os.environ.get("SUPERVISOR_TOKEN", "")
+            ha_url = ha_base_url()
+            token = ha_token()
             try:
                 async with _aiohttp.ClientSession() as sess:
-                    headers = {"Authorization": f"Bearer {ha_token}"}
-                    async with sess.get(f"{ha_url}/api/states", headers=headers, timeout=_aiohttp.ClientTimeout(total=10)) as resp:
+                    headers = {"Authorization": f"Bearer {token}"}
+                    async with sess.get(f"{ha_url}/api/states", headers=headers, timeout=_aiohttp.ClientTimeout(total=10), **ha_ssl_kwargs()) as resp:
                         if resp.status == 200:
                             states = await resp.json()
                             _entity_cache["data"] = [
@@ -2654,15 +2660,16 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         if not entity_id:
             return JSONResponse(content={"forecast_attributes": []})
 
-        ha_url = os.environ.get("HA_URL", "http://supervisor/core")
-        ha_token = os.environ.get("SUPERVISOR_TOKEN", "")
+        ha_url = ha_base_url()
+        token = ha_token()
         try:
             async with _aiohttp.ClientSession() as sess:
-                headers = {"Authorization": f"Bearer {ha_token}"}
+                headers = {"Authorization": f"Bearer {token}"}
                 async with sess.get(
                     f"{ha_url}/api/states/{entity_id}",
                     headers=headers,
                     timeout=_aiohttp.ClientTimeout(total=5),
+                    **ha_ssl_kwargs(),
                 ) as resp:
                     if resp.status != 200:
                         return JSONResponse(content={
@@ -2770,7 +2777,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
                     forecast_types.append("twice_daily")
                 for ftype in forecast_types:
                     sample_keys = await _probe_weather_forecast_keys(
-                        ha_url, ha_token, entity_id, ftype, VAL_KEYS,
+                        ha_url, token, entity_id, ftype, VAL_KEYS,
                     )
                     if sample_keys is None:
                         # Service call failed — surface the option
@@ -2810,15 +2817,16 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
                 "attribute_preview": None,
             })
 
-        ha_url = os.environ.get("HA_URL", "http://supervisor/core")
-        ha_token = os.environ.get("SUPERVISOR_TOKEN", "")
+        ha_url = ha_base_url()
+        token = ha_token()
         try:
             sess = _get_shared_ha_session()
-            headers = {"Authorization": f"Bearer {ha_token}"}
+            headers = {"Authorization": f"Bearer {token}"}
             async with sess.get(
                 f"{ha_url}/api/states/{entity_id}",
                 headers=headers,
                 timeout=_aiohttp.ClientTimeout(total=5),
+                **ha_ssl_kwargs(),
             ) as resp:
                 if resp.status == 404:
                     return JSONResponse(content={
@@ -3364,14 +3372,15 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
         block the add on a transient fetch failure)."""
         import aiohttp as _aiohttp
         attr = (attribute or "forecast").strip()
-        ha_url = os.environ.get("HA_URL", "http://supervisor/core")
-        ha_token = os.environ.get("SUPERVISOR_TOKEN", "")
+        ha_url = ha_base_url()
+        token = ha_token()
         try:
             async with _aiohttp.ClientSession() as sess:
                 async with sess.get(
                     f"{ha_url}/api/states/{entity}",
-                    headers={"Authorization": f"Bearer {ha_token}"},
+                    headers={"Authorization": f"Bearer {token}"},
                     timeout=_aiohttp.ClientTimeout(total=5),
+                    **ha_ssl_kwargs(),
                 ) as resp:
                     if resp.status != 200:
                         return None  # can't confirm — don't block the add

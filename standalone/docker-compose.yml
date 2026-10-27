@@ -1,0 +1,31 @@
+# Run ML Forecast Lab as a plain Docker container, without the Home
+# Assistant Supervisor. See "Running standalone" in ml-forecast-lab/DOCS.md.
+#
+#   1. Create a long-lived access token in Home Assistant (Profile → Security).
+#   2. Put it in a .env file next to this file:  HA_TOKEN=<your token>
+#   3. Adjust HA_URL below, then: docker compose up -d --build
+#   4. Open http://<docker-host>:5052
+services:
+  ml-forecast-lab:
+    container_name: ml-forecast-lab
+    build:
+      context: ../ml-forecast-lab
+      args:
+        # Use the base image matching your CPU (amd64 shown).
+        BUILD_FROM: ghcr.io/hassio-addons/ubuntu-base/amd64:9.0.5
+        # CPU-only torch keeps the image several GB smaller on x86 hosts.
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    image: ml-forecast-lab:standalone
+    restart: unless-stopped
+    ports:
+      - "5052:5052"
+    environment:
+      HA_URL: http://homeassistant.local:8123
+      HA_TOKEN: ${HA_TOKEN}
+      # Only for self-signed certificates:
+      # HA_VERIFY_SSL: "false"
+      TZ: Europe/London
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config:/config   # mlfl.yaml lives here
+      - ./data:/data       # history cache, models, logs

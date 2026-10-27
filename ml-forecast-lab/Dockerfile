@@ -23,11 +23,25 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional: install torch from a dedicated index first, e.g. the CPU-only
+# wheels (https://download.pytorch.org/whl/cpu) for x86 hosts without a
+# GPU. Unset (the add-on default) keeps the regular PyPI resolution.
+# The index stays available for the requirements install: when another
+# package caps torch below the version installed first, pip then picks the
+# matching wheel from that index instead of the CUDA build from PyPI.
+ARG TORCH_INDEX_URL=""
+
 # Install Python dependencies into a virtual environment
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+    && if [ -n "${TORCH_INDEX_URL}" ]; then \
+        /opt/venv/bin/pip install --no-cache-dir torch --index-url "${TORCH_INDEX_URL}" \
+        && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+            --extra-index-url "${TORCH_INDEX_URL}"; \
+    else \
+        /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt; \
+    fi
 
 # ===== Stage 2: Runtime =====
 FROM ${BUILD_FROM}
