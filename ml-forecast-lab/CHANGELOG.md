@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.54.1
+
+### Fixed
+
+**Run All Benchmarks now starts the benchmarks.**
+
+- Clicking **Run All Benchmarks** on the dashboard said the runs were queued,
+  but none ran.
+- Afterwards each experiment counted as busy and refused further runs until
+  the app restarted.
+- The button now starts the benchmarks.
+- Benchmarks started through an experiment's pipeline were not affected.
+- [Technical details](https://github.com/psweens/ml-forecast-lab/blob/main/docs/investigations/2026-10-benchmark-buttons-never-ran.md)
+
 ## 2.54.0
 
 ### Fixed
